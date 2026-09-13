@@ -21,5 +21,6 @@ output/
 .idea/
 .vscode/
 
+/tests
 /docs
 AGENTS.md
