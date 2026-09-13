@@ -20,3 +20,6 @@ output/
 # IDE
 .idea/
 .vscode/
+
+/docs
+AGENTS.md
