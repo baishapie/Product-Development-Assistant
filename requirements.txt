@@ -1,0 +1,24 @@
+# Orchestration
+langgraph>=0.2
+
+# LLM access (OpenAI-compatible: OpenAI / DeepSeek / Qwen / relays)
+openai>=1.40
+
+# Validation & config
+pydantic>=2.7,<3
+pydantic-settings>=2.3
+python-dotenv>=1.0
+
+# Process monitoring (LangGraph auto-instrumented; wrap OpenAI calls too)
+langsmith>=0.1.100
+
+# Web API (FastAPI serves the workflow + single-file frontend)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Tests
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Code quality
+ruff>=0.5

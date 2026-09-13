@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ProductMind AI</title>
+    <style>
+      :root {
+        --bg: #f1f5f9;
+        --card: #ffffff;
+        --text: #1e293b;
+        --muted: #64748b;
+        --border: #e2e8f0;
+        --primary: #2563eb;
+        --green: #059669;
+        --amber: #d97706;
+        --red: #dc2626;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        font-size: 14px;
+        line-height: 1.6;
+      }
+      .wrap { max-width: 960px; margin: 0 auto; padding: 24px; }
+      header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+      h1 { font-size: 22px; margin: 0; }
+      .sub { color: var(--muted); font-size: 13px; }
+      .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05); }
+      .badge { border-radius: 999px; padding: 4px 12px; font-size: 13px; font-weight: 600; }
+      .badge.idle { background: #e2e8f0; color: #475569; }
+      .badge.running { background: #dbeafe; color: #1d4ed8; }
+      .badge.awaiting_review { background: #fef3c7; color: #b45309; }
+      .badge.done { background: #d1fae5; color: #047857; }
+      .badge.failed { background: #fee2e2; color: #b91c1c; }
+      textarea { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: inherit; resize: vertical; }
+      textarea:focus { outline: none; border-color: var(--primary); }
+      button { border: none; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 600; color: #fff; cursor: pointer; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .btn-primary { background: var(--primary); }
+      .btn-green { background: var(--green); }
+      .btn-amber { background: var(--amber); }
+      .row { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+      .muted { color: var(--muted); font-size: 12px; }
+      .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+      .chip { border-radius: 8px; padding: 5px 12px; background: #f1f5f9; color: #475569; font-size: 13px; }
+      .chip.done { background: #d1fae5; color: #047857; }
+      pre.artifact { background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px; max-height: 300px; overflow: auto; font-size: 12px; }
+      .error { border: 1px solid #fecaca; background: #fef2f2; color: #b91c1c; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; }
+      .markdown h1 { font-size: 20px; }
+      .markdown h2 { font-size: 17px; border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-top: 20px; }
+      .markdown h3 { font-size: 15px; margin-top: 14px; }
+      .markdown ul { padding-left: 20px; }
+      .markdown table { border-collapse: collapse; margin: 8px 0; }
+      .markdown th, .markdown td { border: 1px solid #cbd5e1; padding: 4px 8px; font-size: 13px; }
+      .markdown blockquote { border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 10px; color: var(--muted); }
+      .markdown a { color: var(--primary); }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div>
+          <h1>ProductMind AI</h1>
+          <div class="sub">多智能体产品研发助手 · Web 控制台</div>
+        </div>
+        <span id="status" class="badge idle">待开始</span>
+      </header>
+
+      <div id="error" class="error hidden"></div>
+
+      <section class="card">
+        <label class="sub" for="idea">产品想法</label>
+        <textarea id="idea" rows="3">设计一个 AI 旅游规划 App</textarea>
+        <div class="row">
+          <button id="start" class="btn-primary">开始生成</button>
+          <span id="runid" class="muted"></span>
+        </div>
+      </section>
+
+      <section id="progress-card" class="card hidden">
+        <h2 style="font-size: 15px; margin: 0 0 10px">执行进度</h2>
+        <div id="progress" class="chips"></div>
+      </section>
+
+      <section id="review-card" class="card hidden" style="border-color: #fde68a">
+        <h2 id="review-title" style="font-size: 16px; margin: 0 0 4px; color: #b45309"></h2>
+        <div id="review-round" class="muted" style="margin-bottom: 10px"></div>
+        <pre id="review-artifact" class="artifact"></pre>
+        <textarea id="feedback" rows="3" placeholder="通过可留空；如需修改，请填写修改意见" style="margin-top: 10px"></textarea>
+        <div class="row">
+          <button id="approve" class="btn-green">确认通过</button>
+          <button id="revise" class="btn-amber">提出修改</button>
+        </div>
+      </section>
+
+      <section id="failed-card" class="card hidden" style="border-color: #fecaca">
+        <h2 style="font-size: 16px; color: var(--red); margin: 0 0 6px">执行失败</h2>
+        <div id="failed-msg" class="sub"></div>
+      </section>
+
+      <section id="doc-card" class="card hidden">
+        <div class="row" style="justify-content: space-between; margin: 0 0 12px">
+          <h2 style="font-size: 16px; margin: 0">产品设计文档</h2>
+          <a id="download" class="muted" href="#" download="product_document.md">下载 Markdown</a>
+        </div>
+        <article id="doc" class="markdown"></article>
+      </section>
+    </div>
+
+    <script>
+      // ---- 全局状态 ----
+      var state = { runId: "", data: null, error: "", starting: false, docHtml: "" };
+      var timer = null;
+
+      var el = function (id) { return document.getElementById(id); };
+      var STATUS_TEXT = { idle: "待开始", running: "执行中", awaiting_review: "等待人工确认", done: "已完成", failed: "失败" };
+
+      function setError(message) {
+        state.error = message || "";
+        var box = el("error");
+        if (state.error) { box.textContent = state.error; box.classList.remove("hidden"); }
+        else { box.classList.add("hidden"); }
+      }
+
+      function show(id, visible) {
+        el(id).classList.toggle("hidden", !visible);
+      }
+
+      // ---- 极简 Markdown 渲染（标题/列表/表格/引用/加粗）----
+      function escapeHtml(text) {
+        return String(text).replace(/[&<>]/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
+        });
+      }
+      function inline(text) {
+        return escapeHtml(text)
+          .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+          .replace(/`(.+?)`/g, "<code>$1</code>");
+      }
+      function renderMarkdown(md) {
+        var lines = String(md).split(/\r?\n/);
+        var html = "", inUl = false, inTable = false;
+        function closeUl() { if (inUl) { html += "</ul>"; inUl = false; } }
+        function closeTable() { if (inTable) { html += "</table>"; inTable = false; } }
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (/^\s*$/.test(line)) { closeUl(); closeTable(); continue; }
+          var heading = line.match(/^(#{1,6})\s+(.*)$/);
+          if (heading) {
+            closeUl(); closeTable();
+            var level = heading[1].length;
+            html += "<h" + level + ">" + inline(heading[2]) + "</h" + level + ">";
+            continue;
+          }
+          if (/^\s*[-*]\s+/.test(line)) {
+            closeTable();
+            if (!inUl) { html += "<ul>"; inUl = true; }
+            html += "<li>" + inline(line.replace(/^\s*[-*]\s+/, "")) + "</li>";
+            continue;
+          }
+          if (/^\s*\|.*\|\s*$/.test(line)) {
+            closeUl();
+            if (/^\s*\|[\s:|-]+\|\s*$/.test(line)) continue;
+            var cells = line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+            if (!inTable) {
+              inTable = true;
+              html += "<table><tr>" + cells.map(function (c) { return "<th>" + inline(c) + "</th>"; }).join("") + "</tr>";
+            } else {
+              html += "<tr>" + cells.map(function (c) { return "<td>" + inline(c) + "</td>"; }).join("") + "</tr>";
+            }
+            continue;
+          }
+          if (/^\s*>\s?/.test(line)) {
+            closeUl(); closeTable();
+            html += "<blockquote>" + inline(line.replace(/^\s*>\s?/, "")) + "</blockquote>";
+            continue;
+          }
+          closeUl(); closeTable();
+          html += "<p>" + inline(line) + "</p>";
+        }
+        closeUl(); closeTable();
+        return html;
+      }
+
+      // ---- 渲染 ----
+      function render() {
+        var status = state.data ? state.data.status : state.runId ? "running" : "idle";
+        var badge = el("status");
+        badge.textContent = STATUS_TEXT[status];
+        badge.className = "badge " + status;
+        el("start").disabled = state.starting;
+        el("start").textContent = state.starting ? "启动中..." : "开始生成";
+        el("runid").textContent = state.runId ? "run_id: " + state.runId : "";
+
+        var data = state.data;
+        var plan = data ? data.plan || [] : [];
+        var completed = data ? data.completed || [] : [];
+        show("progress-card", plan.length > 0);
+        if (plan.length > 0) {
+          var chips = ["<span class='chip'>Supervisor（规划）</span>"];
+          plan.forEach(function (task) {
+            var done = completed.indexOf(task) !== -1;
+            chips.push("<span class='chip " + (done ? "done" : "") + "'>" + task + (done ? " ✓" : " …") + "</span>");
+          });
+          el("progress").innerHTML = chips.join("");
+        }
+
+        var review = data ? data.review : null;
+        show("review-card", !!review);
+        if (review) {
+          el("review-title").textContent = "待确认：" + (review.stage === "product" ? "需求确认" : "技术方案确认");
+          el("review-round").textContent = "第 " + review.round + "/" + review.max_rounds + " 轮";
+          el("review-artifact").textContent = JSON.stringify(review.artifact, null, 2);
+        }
+
+        show("failed-card", !!data && data.status === "failed");
+        if (data && data.status === "failed") {
+          el("failed-msg").textContent = data.error || "未知错误";
+        }
+
+        show("doc-card", !!state.docHtml);
+        if (state.docHtml) {
+          el("doc").innerHTML = state.docHtml;
+          el("download").href = "/api/runs/" + state.runId + "/document";
+        }
+      }
+
+      // ---- 轮询 ----
+      function poll() {
+        fetch("/api/runs/" + state.runId)
+          .then(function (res) {
+            if (!res.ok) throw new Error("状态查询失败：" + res.status);
+            return res.json();
+          })
+          .then(function (json) {
+            state.data = json;
+            render();
+            if (json.status === "done" || json.status === "failed") {
+              clearInterval(timer);
+              if (json.status === "done") loadDocument();
+            }
+          })
+          .catch(function (err) {
+            setError(String(err));
+            clearInterval(timer);
+          });
+      }
+
+      function loadDocument() {
+        fetch("/api/runs/" + state.runId + "/document")
+          .then(function (res) { return res.text(); })
+          .then(function (text) {
+            state.docHtml = renderMarkdown(text);
+            render();
+          })
+          .catch(function (err) { setError(String(err)); });
+      }
+
+      // ---- 操作 ----
+      function start() {
+        setError("");
+        state.data = null;
+        state.runId = "";
+        state.docHtml = "";
+        state.starting = true;
+        el("feedback").value = "";
+        render();
+        fetch("/api/runs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ idea: el("idea").value }),
+        })
+          .then(function (res) {
+            if (!res.ok) throw new Error("启动失败：" + res.status);
+            return res.json();
+          })
+          .then(function (json) {
+            state.runId = json.run_id;
+            state.starting = false;
+            render();
+            clearInterval(timer);
+            timer = setInterval(poll, 1500);
+            poll();
+          })
+          .catch(function (err) {
+            state.starting = false;
+            setError(String(err));
+            render();
+          });
+      }
+
+      function submitReview(decision) {
+        if (!state.runId) return;
+        setError("");
+        fetch("/api/runs/" + state.runId + "/review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision: decision, feedback: el("feedback").value.trim() }),
+        })
+          .then(function (res) {
+            if (!res.ok) throw new Error("提交确认失败：" + res.status);
+            el("feedback").value = "";
+            clearInterval(timer);
+            timer = setInterval(poll, 1500);
+            poll();
+          })
+          .catch(function (err) { setError(String(err)); });
+      }
+
+      el("start").addEventListener("click", start);
+      el("approve").addEventListener("click", function () { submitReview("approved"); });
+      el("revise").addEventListener("click", function () { submitReview("revise"); });
+      render();
+    </script>
+  </body>
+</html>
