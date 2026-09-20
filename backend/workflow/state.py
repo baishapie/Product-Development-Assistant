@@ -1,8 +1,8 @@
 """工作流共享状态（LangGraph ``StateGraph`` 的 channel 定义）。
 
-累加型字段用 ``Annotated`` 声明 reducer：因为 LangGraph 只对顶层字段做合并，
-嵌套 dict 默认是整体覆盖，若不声明 reducer，节点返回
-``{"results": {"product": ...}}`` 会把其它 Agent 的结果一并覆盖掉。
+累加型字段用 ``Annotated`` 声明 reducer：LangGraph 只对顶层字段做合并，
+嵌套 dict 默认整体覆盖，若不声明 reducer，节点返回 ``{"results": {...}}``
+会把其它 Agent 的结果一并覆盖掉。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Annotated, Any, TypedDict
 
 
 def merge_dict(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
-    """合并字典型状态字段（results / retries / review_rounds）。"""
+    """合并字典型状态字段（results / retries / review_rounds / gate_status）。"""
     return {**left, **right}
 
 
@@ -21,8 +21,10 @@ class AgentState(TypedDict):
 
     # 输入
     idea: str
-    # 规划（Supervisor 仅首轮写入）
+    # 规划与路由（Supervisor）
     plan: list[str]
+    next_action: str | None
+    iteration_count: int
     completed: Annotated[list[str], operator.add]
     current_task: str | None
     # 各 Agent 结果：task_id -> 结构化 dict（Pydantic model_dump 后）
@@ -34,11 +36,12 @@ class AgentState(TypedDict):
     status: str  # "running" | "awaiting_review" | "done" | "failed"
     error: str | None
     retries: Annotated[dict[str, int], merge_dict]
-    # 人工确认（HITL）：两个阶段闸门
+    # 人工确认（HITL）与自动评审
     review_stage: str | None  # "product" | "architect" | None
     review_decision: str | None  # "approved" | "revise" | "skipped" | None
     review_feedback: str | None
     review_rounds: Annotated[dict[str, int], merge_dict]
+    gate_status: Annotated[dict[str, str], merge_dict]  # stage -> approved/revise/skipped
     # 预留：Memory(Phase 3) / 对话历史
     messages: Annotated[list[dict[str, str]], operator.add]
 
@@ -48,6 +51,8 @@ def new_state(idea: str) -> AgentState:
     return {
         "idea": idea,
         "plan": [],
+        "next_action": None,
+        "iteration_count": 0,
         "completed": [],
         "current_task": None,
         "results": {},
@@ -60,5 +65,6 @@ def new_state(idea: str) -> AgentState:
         "review_decision": None,
         "review_feedback": None,
         "review_rounds": {},
+        "gate_status": {},
         "messages": [],
     }

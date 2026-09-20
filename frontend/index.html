@@ -57,7 +57,7 @@
       .markdown table { border-collapse: collapse; margin: 8px 0; }
       .markdown th, .markdown td { border: 1px solid #cbd5e1; padding: 4px 8px; font-size: 13px; }
       .markdown blockquote { border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 10px; color: var(--muted); }
-      .markdown a { color: var(--primary); }
+      .markdown code { background: #f1f5f9; padding: 1px 4px; border-radius: 4px; }
       .hidden { display: none; }
     </style>
   </head>
@@ -116,9 +116,17 @@
       // ---- 全局状态 ----
       var state = { runId: "", data: null, error: "", starting: false, docHtml: "" };
       var timer = null;
+      var POLL_MS = 1500;
 
-      var el = function (id) { return document.getElementById(id); };
-      var STATUS_TEXT = { idle: "待开始", running: "执行中", awaiting_review: "等待人工确认", done: "已完成", failed: "失败" };
+      var STATUS_TEXT = {
+        idle: "待开始",
+        running: "执行中",
+        awaiting_review: "等待人工确认",
+        done: "已完成",
+        failed: "失败",
+      };
+
+      function el(id) { return document.getElementById(id); }
 
       function setError(message) {
         state.error = message || "";
@@ -127,11 +135,9 @@
         else { box.classList.add("hidden"); }
       }
 
-      function show(id, visible) {
-        el(id).classList.toggle("hidden", !visible);
-      }
+      function show(id, visible) { el(id).classList.toggle("hidden", !visible); }
 
-      // ---- 极简 Markdown 渲染（标题/列表/表格/引用/加粗）----
+      // ---- 极简 Markdown 渲染（标题/列表/表格/引用/加粗/行内代码）----
       function escapeHtml(text) {
         return String(text).replace(/[&<>]/g, function (c) {
           return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
@@ -144,27 +150,35 @@
       }
       function renderMarkdown(md) {
         var lines = String(md).split(/\r?\n/);
-        var html = "", inUl = false, inTable = false;
+        var html = "", inUl = false, inOl = false, inTable = false;
         function closeUl() { if (inUl) { html += "</ul>"; inUl = false; } }
+        function closeOl() { if (inOl) { html += "</ol>"; inOl = false; } }
         function closeTable() { if (inTable) { html += "</table>"; inTable = false; } }
+        function closeLists() { closeUl(); closeOl(); }
         for (var i = 0; i < lines.length; i++) {
           var line = lines[i];
-          if (/^\s*$/.test(line)) { closeUl(); closeTable(); continue; }
+          if (/^\s*$/.test(line)) { closeLists(); closeTable(); continue; }
           var heading = line.match(/^(#{1,6})\s+(.*)$/);
           if (heading) {
-            closeUl(); closeTable();
+            closeLists(); closeTable();
             var level = heading[1].length;
             html += "<h" + level + ">" + inline(heading[2]) + "</h" + level + ">";
             continue;
           }
-          if (/^\s*[-*]\s+/.test(line)) {
-            closeTable();
+          if (/^\s*[-*+]\s+/.test(line)) {
+            closeOl(); closeTable();
             if (!inUl) { html += "<ul>"; inUl = true; }
-            html += "<li>" + inline(line.replace(/^\s*[-*]\s+/, "")) + "</li>";
+            html += "<li>" + inline(line.replace(/^\s*[-*+]\s+/, "")) + "</li>";
+            continue;
+          }
+          if (/^\s*\d+[.)]\s+/.test(line)) {
+            closeUl(); closeTable();
+            if (!inOl) { html += "<ol>"; inOl = true; }
+            html += "<li>" + inline(line.replace(/^\s*\d+[.)]\s+/, "")) + "</li>";
             continue;
           }
           if (/^\s*\|.*\|\s*$/.test(line)) {
-            closeUl();
+            closeLists();
             if (/^\s*\|[\s:|-]+\|\s*$/.test(line)) continue;
             var cells = line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
             if (!inTable) {
@@ -176,14 +190,14 @@
             continue;
           }
           if (/^\s*>\s?/.test(line)) {
-            closeUl(); closeTable();
+            closeLists(); closeTable();
             html += "<blockquote>" + inline(line.replace(/^\s*>\s?/, "")) + "</blockquote>";
             continue;
           }
-          closeUl(); closeTable();
+          closeLists(); closeTable();
           html += "<p>" + inline(line) + "</p>";
         }
-        closeUl(); closeTable();
+        closeLists(); closeTable();
         return html;
       }
 
@@ -191,7 +205,7 @@
       function render() {
         var status = state.data ? state.data.status : state.runId ? "running" : "idle";
         var badge = el("status");
-        badge.textContent = STATUS_TEXT[status];
+        badge.textContent = STATUS_TEXT[status] || status;
         badge.className = "badge " + status;
         el("start").disabled = state.starting;
         el("start").textContent = state.starting ? "启动中..." : "开始生成";
@@ -213,15 +227,14 @@
         var review = data ? data.review : null;
         show("review-card", !!review);
         if (review) {
-          el("review-title").textContent = "待确认：" + (review.stage === "product" ? "需求确认" : "技术方案确认");
+          var label = review.stage === "product" ? "需求确认" : review.stage === "architect" ? "技术方案确认" : review.stage;
+          el("review-title").textContent = "待确认：" + label;
           el("review-round").textContent = "第 " + review.round + "/" + review.max_rounds + " 轮";
           el("review-artifact").textContent = JSON.stringify(review.artifact, null, 2);
         }
 
         show("failed-card", !!data && data.status === "failed");
-        if (data && data.status === "failed") {
-          el("failed-msg").textContent = data.error || "未知错误";
-        }
+        if (data && data.status === "failed") { el("failed-msg").textContent = data.error || "未知错误"; }
 
         show("doc-card", !!state.docHtml);
         if (state.docHtml) {
@@ -245,19 +258,13 @@
               if (json.status === "done") loadDocument();
             }
           })
-          .catch(function (err) {
-            setError(String(err));
-            clearInterval(timer);
-          });
+          .catch(function (err) { setError(String(err)); clearInterval(timer); });
       }
 
       function loadDocument() {
         fetch("/api/runs/" + state.runId + "/document")
           .then(function (res) { return res.text(); })
-          .then(function (text) {
-            state.docHtml = renderMarkdown(text);
-            render();
-          })
+          .then(function (text) { state.docHtml = renderMarkdown(text); render(); })
           .catch(function (err) { setError(String(err)); });
       }
 
@@ -284,14 +291,10 @@
             state.starting = false;
             render();
             clearInterval(timer);
-            timer = setInterval(poll, 1500);
+            timer = setInterval(poll, POLL_MS);
             poll();
           })
-          .catch(function (err) {
-            state.starting = false;
-            setError(String(err));
-            render();
-          });
+          .catch(function (err) { state.starting = false; setError(String(err)); render(); });
       }
 
       function submitReview(decision) {
@@ -306,7 +309,7 @@
             if (!res.ok) throw new Error("提交确认失败：" + res.status);
             el("feedback").value = "";
             clearInterval(timer);
-            timer = setInterval(poll, 1500);
+            timer = setInterval(poll, POLL_MS);
             poll();
           })
           .catch(function (err) { setError(String(err)); });

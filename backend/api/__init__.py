@@ -1,4 +1,4 @@
-"""FastAPI 应用（Phase 4：Web 入口）。"""
+"""FastAPI 应用（Web 入口）。"""
 
 from backend.api.app import app
 
