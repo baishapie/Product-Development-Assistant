@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -98,14 +100,30 @@ def _invoke_with_retries(
     attempts = settings.agent_max_retries + 1
     last_error: Exception | None = None
     for attempt in range(attempts):
+        started = time.perf_counter()
+        logger.info("agent start", extra={"agent": spec.task_id, "attempt": attempt + 1})
         try:
             out = agent.invoke({"messages": [{"role": "user", "content": spec.build_input(state)}]})
-            return extract_structured(out, spec.output_model), attempt, None
+            result = extract_structured(out, spec.output_model)
+            logger.info(
+                "agent done",
+                extra={
+                    "agent": spec.task_id,
+                    "attempt": attempt,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                },
+            )
+            return result, attempt, None
         except Exception as exc:  # noqa: BLE001 - 统一归一化失败并重试
             last_error = exc
             logger.warning(
                 "agent attempt failed",
-                extra={"agent": spec.task_id, "attempt": attempt + 1, "error": str(exc)},
+                extra={
+                    "agent": spec.task_id,
+                    "attempt": attempt + 1,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                    "error": str(exc),
+                },
             )
     return None, attempts - 1, last_error
 
@@ -177,6 +195,10 @@ def make_supervisor_node(
                 update["next_action"] = "end"
                 update["status"] = "failed"
                 update["error"] = "routing step limit exceeded"
+        logger.info(
+            "supervisor route",
+            extra={"next": update["next_action"], "iteration": iteration},
+        )
         return update
 
     node.__name__ = "supervisor_node"
@@ -212,6 +234,7 @@ def make_reviewer_node(spec: AgentSpec, model: BaseChatModel, settings: Settings
                     "gate_status": {spec.task_id: "approved"},
                 }
             )
+            logger.info("reviewer approved", extra={"agent": spec.task_id, "rounds": rounds})
             return update
 
         feedback = "；".join([*result.issues, *result.suggestions]) or "评审未通过"
@@ -225,6 +248,10 @@ def make_reviewer_node(spec: AgentSpec, model: BaseChatModel, settings: Settings
                 "gate_status": {spec.task_id: "revise"},
             }
         )
+        logger.info(
+            "reviewer revise",
+            extra={"agent": spec.task_id, "target": target, "round": rounds + 1},
+        )
         return update
 
     node.__name__ = f"{spec.task_id}_node"
@@ -236,7 +263,9 @@ def make_document_node(settings: Settings) -> Any:
 
     def node(state: AgentState) -> dict[str, Any]:
         content = render_document(state)
-        path = save_document(content, settings.output_dir)
+        # 按任务分目录，避免多任务互相覆盖
+        run_id = str(state.get("run_id") or "default")
+        path = save_document(content, Path(settings.output_dir) / run_id)
         logger.info("document written", extra={"path": str(path)})
         return {
             "product_document": content,
@@ -261,8 +290,13 @@ def build_graph(
     settings: Settings,
     model: BaseChatModel | None = None,
     reviewer: Reviewer | None = None,
+    checkpointer: Any | None = None,
 ) -> CompiledStateGraph:
-    """组装并编译 MVP 工作流图（带内存 Checkpointer）。"""
+    """组装并编译 MVP 工作流图。
+
+    ``checkpointer`` 缺省为内存 ``MemorySaver``（测试友好）；
+    生产由 ``RunManager`` 注入 ``PostgresSaver`` 以支持断点续跑。
+    """
     client = model or create_chat_model(settings)
 
     graph: StateGraph = StateGraph(AgentState)
@@ -284,4 +318,4 @@ def build_graph(
         graph.add_edge(node, "supervisor")
     graph.add_edge("document", END)
 
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile(checkpointer=checkpointer or MemorySaver())

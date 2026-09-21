@@ -2,25 +2,61 @@
 
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from backend.api.models import ReviewRequest, RunCreated, RunRequest, RunStatus
+from backend.api.models import (
+    ReviewRequest,
+    RunCreated,
+    RunList,
+    RunRequest,
+    RunStatus,
+    RunSummary,
+)
 from backend.api.service import get_manager
+
+logger = logging.getLogger(__name__)
 
 # backend/api/app.py -> 仓库根目录
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
-app = FastAPI(title="ProductMind AI", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时尝试恢复中断任务，退出时释放存储/隧道。"""
+    try:
+        get_manager().recover()
+    except Exception:  # noqa: BLE001 - 恢复失败不阻塞启动
+        logger.exception("startup recover failed")
+    yield
+    try:
+        get_manager().close()
+    except Exception:  # noqa: BLE001
+        logger.exception("shutdown close failed")
+
+
+app = FastAPI(title="ProductMind AI", version="0.1.0", lifespan=lifespan)
 
 
 @app.post("/api/runs", response_model=RunCreated, status_code=201)
 def create_run(request: RunRequest) -> RunCreated:
     """创建并异步启动一次工作流运行。"""
-    run_id = get_manager().start(request.idea.strip())
+    idea = request.idea.strip()
+    logger.info("POST /api/runs", extra={"idea_len": len(idea)})
+    run_id = get_manager().start(idea)
+    logger.info("run created", extra={"run_id": run_id})
     return RunCreated(run_id=run_id)
+
+
+@app.get("/api/runs", response_model=RunList)
+def list_runs(status: str | None = None, limit: int = 20, offset: int = 0) -> RunList:
+    """列出历史任务（支持按状态筛选与分页）。"""
+    total, rows = get_manager().list_runs(status=status, limit=limit, offset=offset)
+    return RunList(total=total, items=[RunSummary.model_validate(row) for row in rows])
 
 
 @app.get("/api/runs/{run_id}", response_model=RunStatus)
@@ -39,8 +75,23 @@ def submit_review(run_id: str, request: ReviewRequest) -> dict[str, str]:
     manager = get_manager()
     if manager.get(run_id) is None:
         raise HTTPException(status_code=404, detail="run not found")
+    logger.info("POST review", extra={"run_id": run_id, "decision": request.decision})
     try:
         manager.submit_review(run_id, request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "accepted"}
+
+
+@app.post("/api/runs/{run_id}/resume", status_code=202)
+def resume_run(run_id: str) -> dict[str, str]:
+    """从检查点恢复一次异常中断的运行。"""
+    manager = get_manager()
+    if manager.get(run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    logger.info("POST resume", extra={"run_id": run_id})
+    try:
+        manager.resume(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": "accepted"}
@@ -61,8 +112,17 @@ def get_document(run_id: str) -> PlainTextResponse:
 
 @app.get("/")
 def index() -> FileResponse:
-    """托管单文件前端。"""
+    """托管单文件前端（控制台）。"""
     index_path = _FRONTEND_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="frontend not found")
     return FileResponse(index_path)
+
+
+@app.get("/tasks")
+def tasks_page() -> FileResponse:
+    """托管任务管理页面（查看/恢复/重跑）。"""
+    tasks_path = _FRONTEND_DIR / "tasks.html"
+    if not tasks_path.exists():
+        raise HTTPException(status_code=404, detail="tasks page not found")
+    return FileResponse(tasks_path)

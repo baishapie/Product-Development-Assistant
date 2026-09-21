@@ -17,6 +17,14 @@ python-dotenv>=1.0
 # Optional tracing (Langfuse, OpenTelemetry-based)
 langfuse>=4.0
 
+# Storage: PostgreSQL (run metadata + LangGraph checkpoints), optional SSH tunnel
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+langgraph-checkpoint-postgres>=2.0
+sshtunnel>=0.4
+# sshtunnel 0.4 references paramiko.DSSKey, removed in paramiko 4+
+paramiko<4
+
 # Web API (FastAPI serves the workflow + single-file frontend)
 fastapi>=0.115
 uvicorn[standard]>=0.30

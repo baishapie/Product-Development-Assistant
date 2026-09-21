@@ -9,8 +9,14 @@ __pycache__/
 .env.*
 !.env.example
 
+# SSH keys / secrets (never commit)
+/secrets/ssh/*
+!/secrets/ssh/.gitkeep
+!/secrets/ssh/README.md
+
 # Generated artifacts
 output/
+/data/
 
 # Tool caches
 .pytest_cache/

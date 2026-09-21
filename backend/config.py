@@ -15,6 +15,10 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderName = Literal["openai", "deepseek", "qwen"]
+StorageBackend = Literal["memory", "postgres"]
+
+# 固定使用仓库根目录的 .env，避免因当前工作目录不同而读到别的配置
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 # 各 Provider 的默认 OpenAI 兼容端点 / 模型；显式环境变量可覆盖。
 PROVIDER_PRESETS: dict[str, dict[str, str]] = {
@@ -43,7 +47,7 @@ class Settings(BaseSettings):
     """强类型应用配置；环境变量大小写不敏感。"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -71,6 +75,29 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     reload: bool = False
+
+    # --- Storage (PostgreSQL) ---
+    storage_backend: StorageBackend = "memory"
+    data_dir: Path = Path("./data")
+    pg_host: str = "127.0.0.1"
+    pg_port: int = 5432
+    pg_db: str = "productmind"
+    pg_user: str = "productmind"
+    pg_password: str = ""
+    pg_sslmode: str = "prefer"
+    recover_on_startup: bool = True
+    run_retention_days: int = 0
+
+    # --- SSH tunnel (for PostgreSQL behind a bastion) ---
+    ssh_enabled: bool = False
+    ssh_host: str = ""
+    ssh_port: int = 22
+    ssh_user: str = ""
+    ssh_key_path: Path = Path("./secrets/ssh/id_ed25519")
+    ssh_key_passphrase: str = ""
+    ssh_known_hosts: Path = Path("./secrets/ssh/known_hosts")
+    ssh_local_bind_host: str = "127.0.0.1"
+    ssh_local_bind_port: int = 0
 
     # --- Langfuse tracing (optional) ---
     langfuse_enabled: bool = False

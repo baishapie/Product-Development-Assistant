@@ -37,9 +37,28 @@ class RunStatus(BaseModel):
     """运行状态快照。"""
 
     run_id: str
+    idea: str | None = None
     status: str  # running | awaiting_review | done | failed
     current_task: str | None = None
     completed: list[str] = Field(default_factory=list)
     plan: list[str] = Field(default_factory=list)
     error: str | None = None
     review: ReviewView | None = None
+
+
+class RunSummary(BaseModel):
+    """历史任务列表项。"""
+
+    run_id: str
+    idea: str
+    status: str
+    created_at: str
+    updated_at: str
+    error: str | None = None
+
+
+class RunList(BaseModel):
+    """历史任务分页结果。"""
+
+    total: int
+    items: list[RunSummary]

@@ -58,6 +58,9 @@
       .markdown th, .markdown td { border: 1px solid #cbd5e1; padding: 4px 8px; font-size: 13px; }
       .markdown blockquote { border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 10px; color: var(--muted); }
       .markdown code { background: #f1f5f9; padding: 1px 4px; border-radius: 4px; }
+      .run-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+      .run-item .run-idea { flex: 1; min-width: 200px; }
+      .run-item .run-actions button { padding: 5px 10px; font-size: 12px; }
       .hidden { display: none; }
     </style>
   </head>
@@ -66,7 +69,7 @@
       <header>
         <div>
           <h1>ProductMind AI</h1>
-          <div class="sub">多智能体产品研发助手 · Web 控制台</div>
+          <div class="sub">多智能体产品研发助手 · Web 控制台 · <a href="/tasks" style="color: var(--primary)">任务管理</a></div>
         </div>
         <span id="status" class="badge idle">待开始</span>
       </header>
@@ -80,6 +83,14 @@
           <button id="start" class="btn-primary">开始生成</button>
           <span id="runid" class="muted"></span>
         </div>
+      </section>
+
+      <section class="card">
+        <div class="row" style="justify-content: space-between; margin: 0 0 6px">
+          <h2 style="font-size: 15px; margin: 0">历史任务</h2>
+          <button id="refresh-runs" class="btn-primary" style="padding: 6px 12px; font-size: 13px">刷新</button>
+        </div>
+        <div id="run-list"><div class="muted">加载中…</div></div>
       </section>
 
       <section id="progress-card" class="card hidden">
@@ -256,6 +267,7 @@
             if (json.status === "done" || json.status === "failed") {
               clearInterval(timer);
               if (json.status === "done") loadDocument();
+              loadRuns();
             }
           })
           .catch(function (err) { setError(String(err)); clearInterval(timer); });
@@ -315,10 +327,52 @@
           .catch(function (err) { setError(String(err)); });
       }
 
+      // ---- 历史任务 ----
+      function loadRuns() {
+        var box = el("run-list");
+        fetch("/api/runs?limit=20")
+          .then(function (res) { if (!res.ok) throw new Error("加载失败：" + res.status); return res.json(); })
+          .then(function (json) {
+            if (!json.items || !json.items.length) { box.innerHTML = "<div class='muted'>暂无任务</div>"; return; }
+            box.innerHTML = json.items.map(function (item) {
+              var canResume = item.status === "failed" || item.status === "running";
+              return "<div class='run-item'>" +
+                "<span class='badge " + item.status + "'>" + (STATUS_TEXT[item.status] || item.status) + "</span>" +
+                "<span class='run-idea'>" + escapeHtml(item.idea) + "</span>" +
+                "<span class='muted'>" + escapeHtml(item.created_at) + "</span>" +
+                "<span class='run-actions'>" +
+                  "<button class='btn-primary' onclick=\"viewRun('" + item.run_id + "')\">查看</button>" +
+                  (canResume ? "<button class='btn-amber' onclick=\"resumeRun('" + item.run_id + "')\">恢复</button>" : "") +
+                "</span>" +
+              "</div>";
+            }).join("");
+          })
+          .catch(function (err) { box.innerHTML = "<div class='muted'>" + escapeHtml(String(err)) + "</div>"; });
+      }
+
+      function viewRun(runId) {
+        setError("");
+        state.runId = runId;
+        state.data = null;
+        state.docHtml = "";
+        render();
+        clearInterval(timer);
+        timer = setInterval(poll, POLL_MS);
+        poll();
+      }
+
+      function resumeRun(runId) {
+        fetch("/api/runs/" + runId + "/resume", { method: "POST" })
+          .then(function (res) { if (!res.ok) throw new Error("恢复失败：" + res.status); viewRun(runId); })
+          .catch(function (err) { setError(String(err)); });
+      }
+
       el("start").addEventListener("click", start);
       el("approve").addEventListener("click", function () { submitReview("approved"); });
       el("revise").addEventListener("click", function () { submitReview("revise"); });
+      el("refresh-runs").addEventListener("click", loadRuns);
       render();
+      loadRuns();
     </script>
   </body>
 </html>

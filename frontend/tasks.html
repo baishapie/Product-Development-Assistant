@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ProductMind AI · 任务管理</title>
+    <style>
+      :root {
+        --bg: #f1f5f9;
+        --card: #ffffff;
+        --text: #1e293b;
+        --muted: #64748b;
+        --border: #e2e8f0;
+        --primary: #2563eb;
+        --green: #059669;
+        --amber: #d97706;
+        --red: #dc2626;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        font-size: 14px;
+        line-height: 1.6;
+      }
+      .wrap { max-width: 1080px; margin: 0 auto; padding: 24px; }
+      header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+      h1 { font-size: 22px; margin: 0; }
+      .sub { color: var(--muted); font-size: 13px; }
+      a { color: var(--primary); }
+      .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05); }
+      .badge { border-radius: 999px; padding: 4px 12px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+      .badge.idle { background: #e2e8f0; color: #475569; }
+      .badge.running { background: #dbeafe; color: #1d4ed8; }
+      .badge.awaiting_review { background: #fef3c7; color: #b45309; }
+      .badge.done { background: #d1fae5; color: #047857; }
+      .badge.failed { background: #fee2e2; color: #b91c1c; }
+      button { border: none; border-radius: 8px; padding: 7px 14px; font: inherit; font-weight: 600; color: #fff; cursor: pointer; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .btn-primary { background: var(--primary); }
+      .btn-green { background: var(--green); }
+      .btn-amber { background: var(--amber); }
+      .btn-ghost { background: #e2e8f0; color: #334155; }
+      .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .muted { color: var(--muted); font-size: 12px; }
+      select, textarea { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: inherit; }
+      textarea { width: 100%; resize: vertical; }
+      .error { border: 1px solid #fecaca; background: #fef2f2; color: #b91c1c; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; }
+      .task-item { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+      .task-item:last-child { border-bottom: none; }
+      .task-item.active { background: #eff6ff; border-radius: 8px; padding-left: 8px; padding-right: 8px; }
+      .task-item .task-idea { flex: 1; min-width: 220px; }
+      .task-actions button { padding: 5px 10px; font-size: 12px; }
+      .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+      .chip { border-radius: 8px; padding: 4px 10px; background: #f1f5f9; color: #475569; font-size: 13px; }
+      .chip.done { background: #d1fae5; color: #047857; }
+      pre.artifact { background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px; max-height: 280px; overflow: auto; font-size: 12px; }
+      .markdown h1 { font-size: 20px; }
+      .markdown h2 { font-size: 17px; border-bottom: 1px solid var(--border); padding-bottom: 4px; margin-top: 20px; }
+      .markdown h3 { font-size: 15px; margin-top: 14px; }
+      .markdown ul, .markdown ol { padding-left: 22px; }
+      .markdown table { border-collapse: collapse; margin: 8px 0; }
+      .markdown th, .markdown td { border: 1px solid #cbd5e1; padding: 4px 8px; font-size: 13px; }
+      .markdown blockquote { border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 10px; color: var(--muted); }
+      .markdown code { background: #f1f5f9; padding: 1px 4px; border-radius: 4px; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div>
+          <h1>任务管理</h1>
+          <div class="sub"><a href="/">← 返回控制台</a></div>
+        </div>
+        <span id="count" class="muted"></span>
+      </header>
+
+      <div id="error" class="error hidden"></div>
+
+      <section class="card">
+        <div class="row" style="justify-content: space-between">
+          <div class="row">
+            <label class="sub" for="filter">状态</label>
+            <select id="filter">
+              <option value="">全部</option>
+              <option value="running">执行中</option>
+              <option value="awaiting_review">等待确认</option>
+              <option value="done">已完成</option>
+              <option value="failed">失败</option>
+            </select>
+            <input id="search" class="muted" placeholder="按想法/run_id 搜索" style="min-width: 220px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px" />
+          </div>
+          <button id="refresh" class="btn-primary">刷新</button>
+        </div>
+        <div id="task-list" style="margin-top: 10px"><div class="muted">加载中…</div></div>
+      </section>
+
+      <section id="detail" class="card hidden">
+        <div class="row" style="justify-content: space-between; margin-bottom: 6px">
+          <div class="row">
+            <span id="detail-id" class="sub"></span>
+            <span id="detail-status" class="badge idle"></span>
+          </div>
+          <div class="row task-actions">
+            <button id="btn-resume" class="btn-amber hidden">恢复运行</button>
+            <button id="btn-rerun" class="btn-ghost hidden">重新运行</button>
+            <button id="btn-doc" class="btn-primary hidden">查看文档</button>
+          </div>
+        </div>
+        <div id="detail-idea" style="margin-bottom: 6px"></div>
+        <div id="detail-meta" class="muted"></div>
+        <div id="detail-plan" class="chips"></div>
+        <div id="detail-error" class="error hidden" style="margin-top: 10px"></div>
+
+        <div id="review-box" class="hidden" style="margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px">
+          <div id="review-title" style="color: var(--amber); font-weight: 600"></div>
+          <div id="review-round" class="muted" style="margin-bottom: 8px"></div>
+          <pre id="review-artifact" class="artifact"></pre>
+          <textarea id="feedback" rows="3" placeholder="通过可留空；如需修改，请填写修改意见" style="margin-top: 8px"></textarea>
+          <div class="row" style="margin-top: 10px">
+            <button id="approve" class="btn-green">确认通过</button>
+            <button id="revise" class="btn-amber">提出修改</button>
+          </div>
+        </div>
+
+        <article id="doc" class="markdown" style="margin-top: 14px"></article>
+      </section>
+    </div>
+
+    <script>
+      var STATUS_TEXT = { running: "执行中", awaiting_review: "等待确认", done: "已完成", failed: "失败" };
+      var state = { list: [], selected: "", timer: null, docLoading: false };
+
+      function el(id) { return document.getElementById(id); }
+      function setError(msg) {
+        var box = el("error");
+        if (msg) { box.textContent = msg; box.classList.remove("hidden"); }
+        else { box.classList.add("hidden"); }
+      }
+      function show(id, visible) { el(id).classList.toggle("hidden", !visible); }
+
+      // ---- 极简 Markdown ----
+      function escapeHtml(text) {
+        return String(text).replace(/[&<>]/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
+        });
+      }
+      function inline(text) {
+        return escapeHtml(text)
+          .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+          .replace(/`(.+?)`/g, "<code>$1</code>");
+      }
+      function renderMarkdown(md) {
+        var lines = String(md).split(/\r?\n/);
+        var html = "", inUl = false, inOl = false, inTable = false;
+        function closeUl() { if (inUl) { html += "</ul>"; inUl = false; } }
+        function closeOl() { if (inOl) { html += "</ol>"; inOl = false; } }
+        function closeTable() { if (inTable) { html += "</table>"; inTable = false; } }
+        function closeLists() { closeUl(); closeOl(); }
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (/^\s*$/.test(line)) { closeLists(); closeTable(); continue; }
+          var heading = line.match(/^(#{1,6})\s+(.*)$/);
+          if (heading) {
+            closeLists(); closeTable();
+            html += "<h" + heading[1].length + ">" + inline(heading[2]) + "</h" + heading[1].length + ">";
+            continue;
+          }
+          if (/^\s*[-*+]\s+/.test(line)) {
+            closeOl(); closeTable();
+            if (!inUl) { html += "<ul>"; inUl = true; }
+            html += "<li>" + inline(line.replace(/^\s*[-*+]\s+/, "")) + "</li>";
+            continue;
+          }
+          if (/^\s*\d+[.)]\s+/.test(line)) {
+            closeUl(); closeTable();
+            if (!inOl) { html += "<ol>"; inOl = true; }
+            html += "<li>" + inline(line.replace(/^\s*\d+[.)]\s+/, "")) + "</li>";
+            continue;
+          }
+          if (/^\s*\|.*\|\s*$/.test(line)) {
+            closeLists();
+            if (/^\s*\|[\s:|-]+\|\s*$/.test(line)) continue;
+            var cells = line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|");
+            if (!inTable) {
+              inTable = true;
+              html += "<table><tr>" + cells.map(function (c) { return "<th>" + inline(c) + "</th>"; }).join("") + "</tr>";
+            } else {
+              html += "<tr>" + cells.map(function (c) { return "<td>" + inline(c) + "</td>"; }).join("") + "</tr>";
+            }
+            continue;
+          }
+          if (/^\s*>\s?/.test(line)) {
+            closeLists(); closeTable();
+            html += "<blockquote>" + inline(line.replace(/^\s*>\s?/, "")) + "</blockquote>";
+            continue;
+          }
+          closeLists(); closeTable();
+          html += "<p>" + inline(line) + "</p>";
+        }
+        closeLists(); closeTable();
+        return html;
+      }
+
+      // ---- 列表 ----
+      function loadList() {
+        var status = el("filter").value;
+        var url = "/api/runs?limit=100" + (status ? "&status=" + encodeURIComponent(status) : "");
+        fetch(url)
+          .then(function (res) { if (!res.ok) throw new Error("加载失败：" + res.status); return res.json(); })
+          .then(function (json) {
+            var q = el("search").value.trim().toLowerCase();
+            state.list = json.items.filter(function (it) {
+              return !q || it.idea.toLowerCase().indexOf(q) !== -1 || it.run_id.indexOf(q) !== -1;
+            });
+            el("count").textContent = "共 " + json.total + " 条";
+            renderList();
+          })
+          .catch(function (err) { setError(String(err)); });
+      }
+
+      function renderList() {
+        var box = el("task-list");
+        if (!state.list.length) { box.innerHTML = "<div class='muted'>暂无任务</div>"; return; }
+        box.innerHTML = state.list.map(function (it) {
+          var active = it.run_id === state.selected ? " active" : "";
+          return "<div class='task-item" + active + "'>" +
+            "<span class='badge " + it.status + "'>" + (STATUS_TEXT[it.status] || it.status) + "</span>" +
+            "<span class='task-idea'>" + escapeHtml(it.idea) + "</span>" +
+            "<span class='muted'>" + escapeHtml(it.created_at) + "</span>" +
+            "<span class='task-actions'>" +
+              "<button class='btn-primary' onclick=\"selectRun('" + it.run_id + "')\">查看</button>" +
+            "</span>" +
+          "</div>";
+        }).join("");
+      }
+
+      // ---- 详情 ----
+      function selectRun(runId) {
+        setError("");
+        state.selected = runId;
+        state.docLoading = false;
+        el("doc").innerHTML = "";
+        renderList();
+        show("detail", true);
+        fetchStatus();
+        clearInterval(state.timer);
+        state.timer = setInterval(fetchStatus, 1500);
+      }
+
+      function fetchStatus() {
+        if (!state.selected) return;
+        fetch("/api/runs/" + state.selected)
+          .then(function (res) { if (!res.ok) throw new Error("状态查询失败：" + res.status); return res.json(); })
+          .then(renderDetail)
+          .catch(function (err) { setError(String(err)); });
+      }
+
+      function renderDetail(data) {
+        el("detail-id").textContent = "run_id: " + data.run_id;
+        var badge = el("detail-status");
+        badge.textContent = STATUS_TEXT[data.status] || data.status;
+        badge.className = "badge " + data.status;
+        el("detail-idea").textContent = data.idea || "";
+        el("detail-meta").textContent = "当前节点：" + (data.current_task || "-");
+
+        var chips = ["<span class='chip'>Supervisor（规划）</span>"];
+        (data.plan || []).forEach(function (t) {
+          var done = (data.completed || []).indexOf(t) !== -1;
+          chips.push("<span class='chip " + (done ? "done" : "") + "'>" + t + (done ? " ✓" : " …") + "</span>");
+        });
+        el("detail-plan").innerHTML = chips.join("");
+
+        var errBox = el("detail-error");
+        if (data.error) { errBox.textContent = data.error; errBox.classList.remove("hidden"); }
+        else errBox.classList.add("hidden");
+
+        // 待确认
+        var review = data.review;
+        show("review-box", !!review);
+        if (review) {
+          var label = review.stage === "product" ? "需求确认" : review.stage === "architect" ? "技术方案确认" : review.stage;
+          el("review-title").textContent = "待确认：" + label;
+          el("review-round").textContent = "第 " + review.round + "/" + review.max_rounds + " 轮";
+          el("review-artifact").textContent = JSON.stringify(review.artifact, null, 2);
+        }
+
+        // 操作按钮
+        show("btn-resume", data.status === "failed" || data.status === "running");
+        show("btn-rerun", !!data.idea);
+        show("btn-doc", data.status === "done");
+
+        if (data.status === "done") loadDocument();
+      }
+
+      function loadDocument() {
+        if (state.docLoading) return;
+        state.docLoading = true;
+        fetch("/api/runs/" + state.selected + "/document")
+          .then(function (res) { if (!res.ok) throw new Error("文档获取失败：" + res.status); return res.text(); })
+          .then(function (text) { el("doc").innerHTML = renderMarkdown(text); })
+          .catch(function (err) { setError(String(err)); })
+          .finally(function () { state.docLoading = false; });
+      }
+
+      // ---- 操作 ----
+      function resumeRun() {
+        if (!state.selected) return;
+        fetch("/api/runs/" + state.selected + "/resume", { method: "POST" })
+          .then(function (res) {
+            if (!res.ok) throw new Error("恢复失败：" + res.status + "（可能无可恢复的检查点）");
+            fetchStatus(); loadList();
+          })
+          .catch(function (err) { setError(String(err)); });
+      }
+
+      function rerun() {
+        if (!state.selected) return;
+        fetch("/api/runs/" + state.selected)
+          .then(function (res) { return res.json(); })
+          .then(function (data) {
+            if (!data.idea) throw new Error("缺少想法，无法重跑");
+            return fetch("/api/runs", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ idea: data.idea }),
+            });
+          })
+          .then(function (res) {
+            if (!res.ok) throw new Error("重跑失败：" + res.status);
+            return res.json();
+          })
+          .then(function (json) { loadList(); selectRun(json.run_id); })
+          .catch(function (err) { setError(String(err)); });
+      }
+
+      function submitReview(decision) {
+        if (!state.selected) return;
+        fetch("/api/runs/" + state.selected + "/review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision: decision, feedback: el("feedback").value.trim() }),
+        })
+          .then(function (res) { if (!res.ok) throw new Error("提交确认失败：" + res.status); el("feedback").value = ""; fetchStatus(); })
+          .catch(function (err) { setError(String(err)); });
+      }
+
+      el("refresh").addEventListener("click", loadList);
+      el("filter").addEventListener("change", loadList);
+      el("search").addEventListener("input", loadList);
+      el("btn-resume").addEventListener("click", resumeRun);
+      el("btn-rerun").addEventListener("click", rerun);
+      el("btn-doc").addEventListener("click", loadDocument);
+      el("approve").addEventListener("click", function () { submitReview("approved"); });
+      el("revise").addEventListener("click", function () { submitReview("revise"); });
+      loadList();
+    </script>
+  </body>
+</html>

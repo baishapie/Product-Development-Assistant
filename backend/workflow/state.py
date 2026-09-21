@@ -20,6 +20,7 @@ class AgentState(TypedDict):
     """工作流在各节点间传递的共享状态。"""
 
     # 输入
+    run_id: str
     idea: str
     # 规划与路由（Supervisor）
     plan: list[str]
@@ -46,9 +47,10 @@ class AgentState(TypedDict):
     messages: Annotated[list[dict[str, str]], operator.add]
 
 
-def new_state(idea: str) -> AgentState:
+def new_state(idea: str, run_id: str | None = None) -> AgentState:
     """构造工作流初始状态；所有 key 均有初值以符合 reducer 语义。"""
     return {
+        "run_id": run_id or "",
         "idea": idea,
         "plan": [],
         "next_action": None,
