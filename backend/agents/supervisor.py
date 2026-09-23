@@ -70,8 +70,7 @@ def supervisor_state_update(data: dict[str, Any]) -> dict[str, Any]:
 SYSTEM_PROMPT = (
     "你是一名多智能体团队的主管，负责为产品研发任务做规划与调度。"
     "只返回 JSON 对象，不要输出解释或代码围栏。字段："
-    "next(string，下一步要执行的节点，取值范围：product/architect/review_product/"
-    "review_architect/reviewer/document/end)；"
+    "next(string，下一步要执行的节点，取值范围：product/architect/review_product/review_architect/reviewer/document/end)；"
     "tasks(string 数组，仅首轮填写，取值仅限 product、architect，按执行顺序且不重复)；"
     "rationale(string，决策理由)。"
 )

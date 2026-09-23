@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -34,6 +35,15 @@ from backend.workflow.human_review import Reviewer, make_human_review
 from backend.workflow.state import AgentState
 
 logger = logging.getLogger(__name__)
+
+# Agent 输入/输出日志的单条长度上限（超出截断并标注总长度）
+_IO_LIMIT = 8000
+
+
+def _short_json(value: Any, limit: int = _IO_LIMIT) -> str:
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else f"{text[:limit]}...(共 {len(text)} 字符)"
+
 
 # Supervisor 可路由到的节点（``end`` 单独映射到 END）
 ROUTABLE_NODES: tuple[str, ...] = (
@@ -90,6 +100,30 @@ def _choose_next(requested: str, candidates: list[str]) -> str:
     return candidates[0]
 
 
+def _finalize_supervisor(
+    update: dict[str, Any],
+    candidates: list[str],
+    iteration: int,
+    settings: Settings,
+    strategy: str,
+) -> dict[str, Any]:
+    """应用路由步数护栏并记录日志（快路径与 LLM 路径共用）。"""
+    if iteration > settings.max_routing_steps:
+        # 强制收敛：可产出则走文档，否则失败结束
+        if "document" in candidates:
+            update["next_action"] = "document"
+        else:
+            logger.error("routing step limit exceeded", extra={"iteration": iteration})
+            update["next_action"] = "end"
+            update["status"] = "failed"
+            update["error"] = "routing step limit exceeded"
+    logger.info(
+        "supervisor route",
+        extra={"next": update["next_action"], "iteration": iteration, "strategy": strategy},
+    )
+    return update
+
+
 def _invoke_with_retries(
     agent: Any,
     spec: AgentSpec,
@@ -101,9 +135,13 @@ def _invoke_with_retries(
     last_error: Exception | None = None
     for attempt in range(attempts):
         started = time.perf_counter()
-        logger.info("agent start", extra={"agent": spec.task_id, "attempt": attempt + 1})
+        prompt = spec.build_input(state)
+        logger.info(
+            "agent input",
+            extra={"agent": spec.task_id, "attempt": attempt + 1, "input": _short_json(prompt)},
+        )
         try:
-            out = agent.invoke({"messages": [{"role": "user", "content": spec.build_input(state)}]})
+            out = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
             result = extract_structured(out, spec.output_model)
             logger.info(
                 "agent done",
@@ -111,6 +149,7 @@ def _invoke_with_retries(
                     "agent": spec.task_id,
                     "attempt": attempt,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+                    "output": _short_json(result.model_dump()),
                 },
             )
             return result, attempt, None
@@ -167,6 +206,19 @@ def make_supervisor_node(
             return {"next_action": "end", "current_task": "supervisor"}
 
         candidates = allowed_next(state)
+        iteration = int(state.get("iteration_count") or 0) + 1
+
+        # 快路径：候选唯一且计划已生成 → 路由已确定，无需调用 LLM。
+        # 只返回流程控制字段，plan/results/review_* 等由状态合并原样保留（保证 Agent 间状态传递）。
+        if len(candidates) == 1 and state.get("plan"):
+            update: dict[str, Any] = {
+                "next_action": candidates[0],
+                "iteration_count": iteration,
+                "current_task": "supervisor",
+            }
+            return _finalize_supervisor(update, candidates, iteration, settings, "deterministic")
+
+        # 首轮规划 / 多候选：调用 LLM 决策（仅此处会产生一次 LLM 调用）
         decision, attempt, error = _invoke_with_retries(agent, spec, state, settings)
         if decision is None:
             return {
@@ -175,8 +227,6 @@ def make_supervisor_node(
                 "next_action": "end",
                 "current_task": "supervisor",
             }
-
-        iteration = int(state.get("iteration_count") or 0) + 1
         update = spec.build_state_update(decision.model_dump())
         if not state.get("plan"):
             # 首轮必须落地计划（模型未给出合法 tasks 时回退默认顺序）
@@ -185,21 +235,7 @@ def make_supervisor_node(
         update["iteration_count"] = iteration
         update["current_task"] = "supervisor"
         update["retries"] = {"supervisor": attempt}
-
-        if iteration > settings.max_routing_steps:
-            # 强制收敛：可产出则走文档，否则失败结束
-            if "document" in candidates:
-                update["next_action"] = "document"
-            else:
-                logger.error("routing step limit exceeded", extra={"iteration": iteration})
-                update["next_action"] = "end"
-                update["status"] = "failed"
-                update["error"] = "routing step limit exceeded"
-        logger.info(
-            "supervisor route",
-            extra={"next": update["next_action"], "iteration": iteration},
-        )
-        return update
+        return _finalize_supervisor(update, candidates, iteration, settings, "llm")
 
     node.__name__ = "supervisor_node"
     return node

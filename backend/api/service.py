@@ -69,9 +69,7 @@ class RunManager:
                     from backend.workflow.graph import build_graph
 
                     storage = self._ensure_storage()
-                    self._graph = build_graph(
-                        self._settings, checkpointer=storage.checkpointer
-                    )
+                    self._graph = build_graph(self._settings, checkpointer=storage.checkpointer)
         return self._graph
 
     # ------------------------------------------------------------------ lifecycle
@@ -130,9 +128,7 @@ class RunManager:
         storage = self._ensure_storage()
         if storage.backend != "postgres":
             raise ValueError("storage backend does not support resume")
-        snapshot = self._get_graph().get_state(
-            {"configurable": {"thread_id": run.thread_id}}
-        )
+        snapshot = self._get_graph().get_state({"configurable": {"thread_id": run.thread_id}})
         if not getattr(snapshot, "next", None):
             raise ValueError("run has no pending step to resume")
         self._spawn(run, None)
@@ -243,9 +239,7 @@ class RunManager:
     @staticmethod
     def _status_from_record(record: dict[str, Any]) -> dict[str, Any]:
         review = record.get("review")
-        review_view = (
-            {key: review.get(key) for key in _REVIEW_FIELDS} if review else None
-        )
+        review_view = {key: review.get(key) for key in _REVIEW_FIELDS} if review else None
         return {
             "run_id": record["run_id"],
             "idea": record.get("idea"),
@@ -287,9 +281,7 @@ class RunManager:
                     review={key: review.get(key) for key in _REVIEW_FIELDS},
                 )
             elif run.result.get("status") == "done":
-                fields.update(
-                    status="done", output_path=run.result.get("output_path"), error=None
-                )
+                fields.update(status="done", output_path=run.result.get("output_path"), error=None)
             elif run.result.get("status") == "failed":
                 fields.update(status="failed", error=run.result.get("error"))
             else:

@@ -17,6 +17,7 @@ __pycache__/
 # Generated artifacts
 output/
 /data/
+/logs/
 
 # Tool caches
 .pytest_cache/

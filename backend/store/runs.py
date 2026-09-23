@@ -11,7 +11,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from backend.config import Settings
@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass

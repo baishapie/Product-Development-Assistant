@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from backend.api.models import (
@@ -40,6 +41,42 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ProductMind AI", version="0.1.0", lifespan=lifespan)
+
+# 运行状态查询接口（前端高频轮询）不记请求日志
+_STATUS_POLL = re.compile(r"^/api/runs/[^/]+/?$")
+_BODY_LIMIT = 2000
+
+
+def _short(text: str, limit: int = _BODY_LIMIT) -> str:
+    return text if len(text) <= limit else f"{text[:limit]}...(共 {len(text)} 字符)"
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录每次请求的参数与响应码；跳过运行状态查询（轮询）接口。"""
+    path = request.url.path
+    if request.method == "GET" and _STATUS_POLL.match(path):
+        return await call_next(request)
+
+    body_text = ""
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        raw = await request.body()
+        if raw:
+            body_text = _short(raw.decode("utf-8", "replace"))
+
+    response = await call_next(request)
+
+    logger.info(
+        "http request",
+        extra={
+            "method": request.method,
+            "path": path,
+            "query": request.url.query,
+            "body": body_text,
+            "status": response.status_code,
+        },
+    )
+    return response
 
 
 @app.post("/api/runs", response_model=RunCreated, status_code=201)

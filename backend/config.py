@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     port: int = 8000
     reload: bool = False
 
+    # --- Logging ---
+    log_dir: Path = Path("./logs")
+    log_level: str = "INFO"
+    log_to_file: bool = True
+
     # --- Storage (PostgreSQL) ---
     storage_backend: StorageBackend = "memory"
     data_dir: Path = Path("./data")

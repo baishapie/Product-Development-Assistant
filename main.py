@@ -13,8 +13,10 @@ from backend.logging_config import configure_logging
 
 
 def main() -> None:
-    configure_logging()
     settings = get_settings()
+    configure_logging(
+        level=settings.log_level, log_dir=settings.log_dir, to_file=settings.log_to_file
+    )
 
     # 开发热重载时排除缓存/产物目录，减少文件监视开销
     reload_excludes = [

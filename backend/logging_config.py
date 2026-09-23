@@ -1,13 +1,15 @@
-"""统一日志配置：把 ``logger.*(..., extra={...})`` 的上下文字段输出到日志行。
+"""统一日志配置：控制台 + 文件（滚动）。
 
-默认 Python ``logging`` 不会渲染 ``extra`` 字段，未配置 handler 时还会退化为
-只打印 message。这里注册一个 root handler + ``KeyValueFormatter``，把
-``agent=... attempt=...`` 等上下文追加到每行末尾。
+- ``KeyValueFormatter`` 把 ``logger.*(..., extra={...})`` 的上下文字段以 ``key=value``
+  追加到日志行；请用单行值（如 JSON 字符串），避免多行破坏格式。
+- 输出到控制台与 ``{log_dir}/app.log``（RotatingFileHandler，默认 10MB × 5）。
 """
 
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 # LogRecord 内置字段（这些不当作 extra 输出）
 _RESERVED = set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__.keys()) | {
@@ -35,22 +37,41 @@ class KeyValueFormatter(logging.Formatter):
         return f"{base} {suffix}"
 
 
-def configure_logging(level: int = logging.INFO) -> None:
-    """配置 root logger；重复调用是幂等的。"""
+def configure_logging(
+    level: str | int = logging.INFO,
+    log_dir: str | Path | None = None,
+    to_file: bool = True,
+) -> None:
+    """配置 root logger（控制台 + 文件）；重复调用是幂等的。"""
     global _configured
     if _configured:
         return
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        KeyValueFormatter(
-            fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+    if isinstance(level, str):
+        level = logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
+
+    formatter = KeyValueFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if to_file:
+        directory = Path(log_dir) if log_dir else Path("./logs")
+        directory.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                directory / "app.log",
+                maxBytes=10_000_000,
+                backupCount=5,
+                encoding="utf-8",
+            )
+        )
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
     root = logging.getLogger()
-    # 保留已有 handler（避免与宿主重复），仅在为空时接管
     if not root.handlers:
-        root.addHandler(handler)
+        for handler in handlers:
+            root.addHandler(handler)
     root.setLevel(level)
     _configured = True
