@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderName = Literal["openai", "deepseek", "qwen"]
 StorageBackend = Literal["memory", "postgres"]
+AgentSetName = Literal["mvp", "full"]
 
 # 固定使用仓库根目录的 .env，避免因当前工作目录不同而读到别的配置
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -70,6 +71,10 @@ class Settings(BaseSettings):
     max_routing_steps: int = 12
     auto_approve: bool = False
     output_dir: Path = Path("./output")
+    # Agent 集合：mvp=product/architect；full=+backend/frontend/qa
+    agent_set: AgentSetName = "mvp"
+    # 是否让 backend/frontend 并行执行（静态 fanout/join）
+    parallel_agents: bool = False
 
     # --- Server ---
     host: str = "127.0.0.1"
@@ -90,6 +95,8 @@ class Settings(BaseSettings):
     pg_user: str = "productmind"
     pg_password: str = ""
     pg_sslmode: str = "prefer"
+    # 连接会话时区（如 Asia/Shanghai=UTC+8；不要写 "UTC+8"，PG 按 POSIX 会解析成 UTC-8）
+    pg_timezone: str = "Asia/Shanghai"
     recover_on_startup: bool = True
     run_retention_days: int = 0
 
@@ -103,6 +110,16 @@ class Settings(BaseSettings):
     ssh_known_hosts: Path = Path("./secrets/ssh/known_hosts")
     ssh_local_bind_host: str = "127.0.0.1"
     ssh_local_bind_port: int = 0
+
+    # --- Web search (Tavily, optional) ---
+    tavily_enabled: bool = False
+    tavily_api_key: str = ""
+    tavily_max_results: int = 5
+
+    # --- Retry (node-level) ---
+    retry_backoff_base_seconds: float = 2.0
+    retry_backoff_max_seconds: float = 20.0
+    agent_deadline_seconds: int = 180
 
     # --- Langfuse tracing (optional) ---
     langfuse_enabled: bool = False

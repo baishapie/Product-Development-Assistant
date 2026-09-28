@@ -11,11 +11,18 @@ logger = logging.getLogger(__name__)
 
 
 def build_dsn(settings: Settings, local: tuple[str, int] | None = None) -> str:
-    """生成连接串；``local`` 为 SSH 隧道本地端点（启用时）。"""
+    """生成连接串；``local`` 为 SSH 隧道本地端点（启用时）。
+
+    附带 ``options=-c timezone=<PG_TIMEZONE>``，使 **所有** 连接（元数据池 + PostgresSaver）
+    都使用统一会话时区（默认 ``Asia/Shanghai`` = UTC+8）。
+    """
+    from urllib.parse import quote
+
     host, port = local if local else (settings.pg_host, settings.pg_port)
+    options = quote(f"-c timezone={settings.pg_timezone}")
     return (
         f"postgresql://{settings.pg_user}:{settings.pg_password}"
-        f"@{host}:{port}/{settings.pg_db}?sslmode={settings.pg_sslmode}"
+        f"@{host}:{port}/{settings.pg_db}?sslmode={settings.pg_sslmode}&options={options}"
     )
 
 

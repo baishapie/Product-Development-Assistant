@@ -68,7 +68,52 @@ COMMENT ON COLUMN runs.updated_at   IS '最近更新时间（UTC），每次状�
 
 
 -- -----------------------------------------------------------------------------
--- 2) LangGraph 检查点表（对齐 langgraph-checkpoint-postgres 3.1.2）
+-- 2) Agent 调用日志：agent_calls
+--    作用：记录每次 Agent 调用（输入/输出/耗时/尝试次数/错误），用于审计与排查。
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_calls (
+    id                BIGSERIAL PRIMARY KEY,
+    run_id            TEXT NOT NULL,
+    agent             TEXT NOT NULL,
+    attempt           INTEGER NOT NULL DEFAULT 1,
+    status            TEXT NOT NULL,
+    latency_ms        DOUBLE PRECISION,
+    input             TEXT,
+    output            TEXT,
+    error             TEXT,
+    model             TEXT,
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    total_tokens      INTEGER,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 兼容旧表：补齐 token/模型列（幂等）
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS model TEXT;
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER;
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS completion_tokens INTEGER;
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS total_tokens INTEGER;
+CREATE INDEX IF NOT EXISTS idx_agent_calls_run   ON agent_calls(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_calls_agent ON agent_calls(agent);
+
+COMMENT ON TABLE  agent_calls                  IS 'Agent 调用日志：每次调用的输入/输出/耗时/token/尝试次数/错误';
+COMMENT ON COLUMN agent_calls.id               IS '自增主键';
+COMMENT ON COLUMN agent_calls.run_id           IS '所属运行 ID（与 runs.run_id / thread_id 对应）';
+COMMENT ON COLUMN agent_calls.agent            IS 'Agent 标识（task_id，如 product/architect/reviewer/supervisor）';
+COMMENT ON COLUMN agent_calls.attempt          IS '第几次尝试（1 起，含重试）';
+COMMENT ON COLUMN agent_calls.status           IS '调用结果：ok=成功 / failed=失败';
+COMMENT ON COLUMN agent_calls.latency_ms       IS '本次调用耗时（毫秒）';
+COMMENT ON COLUMN agent_calls.input            IS '输入提示词（JSON 字符串，超长截断）';
+COMMENT ON COLUMN agent_calls.output           IS '结构化输出（JSON 字符串，失败时为 NULL）';
+COMMENT ON COLUMN agent_calls.error            IS '失败原因（成功时为 NULL）';
+COMMENT ON COLUMN agent_calls.model            IS '本次调用使用的模型名';
+COMMENT ON COLUMN agent_calls.prompt_tokens    IS '输入 token 数（Provider usage；未知为 NULL）';
+COMMENT ON COLUMN agent_calls.completion_tokens IS '输出 token 数（未知为 NULL）';
+COMMENT ON COLUMN agent_calls.total_tokens     IS '总 token 数（未知为 NULL）';
+COMMENT ON COLUMN agent_calls.created_at       IS '记录时间（UTC）';
+
+
+-- -----------------------------------------------------------------------------
+-- 3) LangGraph 检查点表（对齐 langgraph-checkpoint-postgres 3.1.2）
 --    作用：按 thread_id 保存图状态快照，使 interrupt() 暂停后与进程重启后
 --          都能从最近检查点继续执行（断点续跑）。
 -- -----------------------------------------------------------------------------

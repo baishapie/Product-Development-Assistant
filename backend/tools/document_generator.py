@@ -141,13 +141,151 @@ def _render_risks(research: Mapping[str, Any]) -> str:
     return _bullet_list(threats)
 
 
+def _render_data_models(models: Any) -> str:
+    """渲染后端数据模型：每个模型一个小节（字段表 + 关系）。"""
+    if not isinstance(models, Sequence) or isinstance(models, (str, bytes)) or not models:
+        return _PLACEHOLDER
+    blocks: list[str] = []
+    for model in models:
+        if not isinstance(model, Mapping):
+            blocks.append(f"- {model}")
+            continue
+        name = str(model.get("name", "")).strip() or "（未命名表）"
+        lines = [f"**{name}**", "", "| 字段 | 类型 | 可空 | 说明 |", "| --- | --- | --- | --- |"]
+        fields = model.get("fields")
+        has_field = False
+        if isinstance(fields, Sequence) and not isinstance(fields, (str, bytes)):
+            for field in fields:
+                has_field = True
+                if isinstance(field, Mapping):
+                    nullable = "是" if field.get("nullable") else "否"
+                    lines.append(
+                        f"| {field.get('name', '')} | {field.get('type', '')} | "
+                        f"{nullable} | {field.get('description', '')} |"
+                    )
+                else:
+                    lines.append(f"| {field} | | | |")
+        if not has_field:
+            lines.append("| | | | |")
+        relations = model.get("relations")
+        if (
+            isinstance(relations, Sequence)
+            and not isinstance(relations, (str, bytes))
+            and relations
+        ):
+            lines += ["", "关系：", _bullet_list(relations)]
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _render_api_details(details: Any) -> str:
+    """渲染后端接口详细定义（请求/响应/错误）。"""
+    if not isinstance(details, Sequence) or isinstance(details, (str, bytes)) or not details:
+        return _PLACEHOLDER
+    lines = ["| 方法 | 路径 | 请求 | 响应 | 错误 |", "| --- | --- | --- | --- | --- |"]
+    for item in details:
+        if isinstance(item, Mapping):
+            errors = item.get("errors")
+            errors_text = ""
+            if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)) and errors:
+                errors_text = "；".join(str(e) for e in errors)
+            lines.append(
+                f"| {item.get('method', '')} | {item.get('path', '')} | "
+                f"{item.get('request_schema', '')} | {item.get('response_schema', '')} | "
+                f"{errors_text} |"
+            )
+        else:
+            lines.append(f"| | | | | {item} |")
+    return "\n".join(lines)
+
+
+def _render_pages(pages: Any) -> str:
+    """渲染前端页面清单：**名称**（路由）：说明；组件：…"""
+    if not isinstance(pages, Sequence) or isinstance(pages, (str, bytes)) or not pages:
+        return _PLACEHOLDER
+    lines: list[str] = []
+    for page in pages:
+        if isinstance(page, Mapping):
+            name = str(page.get("name", "")).strip()
+            route = str(page.get("route", "")).strip()
+            description = str(page.get("description", "")).strip()
+            components = page.get("components")
+            suffix = ""
+            if (
+                isinstance(components, Sequence)
+                and not isinstance(components, (str, bytes))
+                and components
+            ):
+                suffix = "；组件：" + "、".join(str(c) for c in components)
+            lines.append(
+                f"- **{name}**（`{route}`）：{description}{suffix}" if name else f"- {description}"
+            )
+        else:
+            lines.append(f"- {page}")
+    return "\n".join(lines)
+
+
+def _render_components(components: Any) -> str:
+    """渲染前端组件清单：**名称**：职责（props：…）"""
+    if (
+        not isinstance(components, Sequence)
+        or isinstance(components, (str, bytes))
+        or not components
+    ):
+        return _PLACEHOLDER
+    lines: list[str] = []
+    for component in components:
+        if isinstance(component, Mapping):
+            name = str(component.get("name", "")).strip()
+            responsibility = str(component.get("responsibility", "")).strip()
+            props = component.get("props")
+            suffix = ""
+            if isinstance(props, Sequence) and not isinstance(props, (str, bytes)) and props:
+                suffix = "（props：" + "、".join(str(p) for p in props) + "）"
+            lines.append(
+                f"- **{name}**：{responsibility}{suffix}" if name else f"- {responsibility}"
+            )
+        else:
+            lines.append(f"- {component}")
+    return "\n".join(lines)
+
+
+def _render_test_cases(cases: Any) -> str:
+    """渲染测试用例表格。"""
+    if not isinstance(cases, Sequence) or isinstance(cases, (str, bytes)) or not cases:
+        return _PLACEHOLDER
+    lines = ["| 用例 | 名称 | 类型 | 步骤 | 预期 |", "| --- | --- | --- | --- | --- |"]
+    for case in cases:
+        if isinstance(case, Mapping):
+            steps = case.get("steps")
+            steps_text = ""
+            if isinstance(steps, Sequence) and not isinstance(steps, (str, bytes)) and steps:
+                steps_text = "；".join(str(step) for step in steps)
+            lines.append(
+                f"| {case.get('id', '')} | {case.get('name', '')} | {case.get('type', '')} | "
+                f"{steps_text} | {case.get('expected', '')} |"
+            )
+        else:
+            lines.append(f"| | | | | {case} |")
+    return "\n".join(lines)
+
+
 def render_document(state: Mapping[str, Any]) -> str:
     """把状态映射（``idea`` / ``results``）渲染为 Markdown 文档。"""
     idea = str(state.get("idea") or "").strip()
     results = _as_dict(state.get("results"))
     product = _as_dict(results.get("product"))
     architect = _as_dict(results.get("architect"))
+    backend = _as_dict(results.get("backend"))
+    frontend = _as_dict(results.get("frontend"))
+    qa = _as_dict(results.get("qa"))
     market = _as_dict(product.get("market_research"))
+    # 数据模型优先用后端产物；否则回退架构师给的文本
+    database_section = (
+        _render_data_models(backend.get("data_models"))
+        if backend.get("data_models")
+        else _text(architect.get("database_schema"))
+    )
 
     parts: list[str] = [
         "# 产品设计文档",
@@ -182,7 +320,16 @@ def render_document(state: Mapping[str, Any]) -> str:
         _bullet_list(product.get("user_stories")),
         "",
         "## 6. 页面设计",
-        _PLACEHOLDER,
+        _render_pages(frontend.get("pages")),
+        "",
+        "### 6.1 组件结构",
+        _render_components(frontend.get("components")),
+        "",
+        "### 6.2 交互流程",
+        _bullet_list(frontend.get("interactions")),
+        "",
+        "### 6.3 状态管理",
+        _text(frontend.get("state_management")),
         "",
         "## 7. API 设计",
         _render_api(architect.get("api_design")),
@@ -195,13 +342,29 @@ def render_document(state: Mapping[str, Any]) -> str:
         _text(architect.get("architecture")),
         "",
         "## 9. 数据库设计",
-        _text(architect.get("database_schema")),
+        database_section,
         "",
         "## 10. 测试方案",
-        _PLACEHOLDER,
+        "### 10.1 测试策略",
+        _text(qa.get("test_strategy")),
+        "",
+        "### 10.2 测试用例",
+        _render_test_cases(qa.get("test_cases")),
+        "",
+        "### 10.3 验收标准",
+        _bullet_list(qa.get("acceptance_criteria")),
         "",
         "## 11. 风险分析",
         _render_risks(market),
+        "",
+        "## 12. 后端接口详细定义",
+        _render_api_details(backend.get("api_details")),
+        "",
+        "## 13. 业务逻辑",
+        _bullet_list(backend.get("business_logic")),
+        "",
+        "## 14. 异常与边界",
+        _bullet_list(backend.get("edge_cases")),
         "",
     ]
     return "\n".join(parts)

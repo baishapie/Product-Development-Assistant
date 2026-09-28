@@ -48,6 +48,8 @@
       .chips { display: flex; gap: 8px; flex-wrap: wrap; }
       .chip { border-radius: 8px; padding: 5px 12px; background: #f1f5f9; color: #475569; font-size: 13px; }
       .chip.done { background: #d1fae5; color: #047857; }
+      .chip.running { background: #dbeafe; color: #1d4ed8; }
+      .chip.disabled { background: #f8fafc; color: #94a3b8; text-decoration: line-through; }
       pre.artifact { background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px; max-height: 300px; overflow: auto; font-size: 12px; }
       .error { border: 1px solid #fecaca; background: #fef2f2; color: #b91c1c; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; }
       .markdown h1 { font-size: 20px; }
@@ -82,6 +84,7 @@
         <div class="row">
           <button id="start" class="btn-primary">开始生成</button>
           <span id="runid" class="muted"></span>
+          <span id="current" class="muted"></span>
         </div>
       </section>
 
@@ -137,6 +140,31 @@
         failed: "失败",
       };
 
+      // 全部节点（含完整版 backend/frontend/qa）的中文名与固定流水线顺序
+      var NODE_LABELS = {
+        supervisor: "主管·规划",
+        product: "产品 PM",
+        review_product: "需求确认",
+        architect: "架构",
+        review_architect: "方案确认",
+        backend: "后端设计",
+        frontend: "前端设计",
+        qa: "测试方案",
+        reviewer: "自动评审",
+        document: "文档生成",
+      };
+      var PIPELINE = [
+        "supervisor", "product", "review_product", "architect", "review_architect",
+        "backend", "frontend", "qa", "reviewer", "document",
+      ];
+      var REVIEW_STAGE_LABELS = {
+        product: "需求确认",
+        architect: "技术方案确认",
+        backend: "后端设计",
+        frontend: "前端设计",
+        qa: "测试方案",
+      };
+
       function el(id) { return document.getElementById(id); }
 
       function setError(message) {
@@ -153,6 +181,12 @@
         return String(text).replace(/[&<>]/g, function (c) {
           return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
         });
+      }
+      // 后端时间为 UTC（ISO），这里按浏览器本地时区展示
+      function formatTime(value) {
+        if (!value) return "";
+        var d = new Date(value);
+        return isNaN(d.getTime()) ? String(value) : d.toLocaleString();
       }
       function inline(text) {
         return escapeHtml(text)
@@ -225,20 +259,36 @@
         var data = state.data;
         var plan = data ? data.plan || [] : [];
         var completed = data ? data.completed || [] : [];
-        show("progress-card", plan.length > 0);
-        if (plan.length > 0) {
-          var chips = ["<span class='chip'>Supervisor（规划）</span>"];
-          plan.forEach(function (task) {
-            var done = completed.indexOf(task) !== -1;
-            chips.push("<span class='chip " + (done ? "done" : "") + "'>" + task + (done ? " ✓" : " …") + "</span>");
-          });
-          el("progress").innerHTML = chips.join("");
+        var current = data ? data.current_task || "" : "";
+        var active = { supervisor: true, reviewer: true, document: true };
+        plan.forEach(function (task) {
+          active[task] = true;
+          if (task === "product" || task === "architect") { active["review_" + task] = true; }
+        });
+
+        el("current").textContent = current ? "当前节点：" + (NODE_LABELS[current] || current) : "";
+
+        show("progress-card", plan.length > 0 || !!current);
+        if (plan.length > 0 || current) {
+          el("progress").innerHTML = PIPELINE.map(function (node) {
+            var label = NODE_LABELS[node] || node;
+            if (!active[node]) {
+              return "<span class='chip disabled' title='当前 Agent 集合未启用'>" + label + "</span>";
+            }
+            if (data && (data.status === "done" || completed.indexOf(node) !== -1)) {
+              return "<span class='chip done'>" + label + " ✓</span>";
+            }
+            if (current === node) {
+              return "<span class='chip running'>" + label + " …</span>";
+            }
+            return "<span class='chip'>" + label + "</span>";
+          }).join("");
         }
 
         var review = data ? data.review : null;
         show("review-card", !!review);
         if (review) {
-          var label = review.stage === "product" ? "需求确认" : review.stage === "architect" ? "技术方案确认" : review.stage;
+          var label = REVIEW_STAGE_LABELS[review.stage] || review.stage;
           el("review-title").textContent = "待确认：" + label;
           el("review-round").textContent = "第 " + review.round + "/" + review.max_rounds + " 轮";
           el("review-artifact").textContent = JSON.stringify(review.artifact, null, 2);
@@ -339,7 +389,7 @@
               return "<div class='run-item'>" +
                 "<span class='badge " + item.status + "'>" + (STATUS_TEXT[item.status] || item.status) + "</span>" +
                 "<span class='run-idea'>" + escapeHtml(item.idea) + "</span>" +
-                "<span class='muted'>" + escapeHtml(item.created_at) + "</span>" +
+                "<span class='muted'>" + escapeHtml(formatTime(item.created_at)) + "</span>" +
                 "<span class='run-actions'>" +
                   "<button class='btn-primary' onclick=\"viewRun('" + item.run_id + "')\">查看</button>" +
                   (canResume ? "<button class='btn-amber' onclick=\"resumeRun('" + item.run_id + "')\">恢复</button>" : "") +

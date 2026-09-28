@@ -17,6 +17,9 @@ python-dotenv>=1.0
 # Optional tracing (Langfuse, OpenTelemetry-based)
 langfuse>=4.0
 
+# Optional web search tool (Tavily)
+tavily-python>=0.5
+
 # Storage: PostgreSQL (run metadata + LangGraph checkpoints), optional SSH tunnel
 psycopg[binary]>=3.2
 psycopg-pool>=3.2

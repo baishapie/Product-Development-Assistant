@@ -69,7 +69,11 @@ class RunManager:
                     from backend.workflow.graph import build_graph
 
                     storage = self._ensure_storage()
-                    self._graph = build_graph(self._settings, checkpointer=storage.checkpointer)
+                    self._graph = build_graph(
+                        self._settings,
+                        checkpointer=storage.checkpointer,
+                        on_agent_call=self._record_agent_call,
+                    )
         return self._graph
 
     # ------------------------------------------------------------------ lifecycle
@@ -177,6 +181,14 @@ class RunManager:
                 run.result = {**run.result, "status": "failed", "error": str(exc)}
             self._persist(run)
 
+    def _record_agent_call(self, record: dict[str, Any]) -> None:
+        """把一次 Agent 调用写入存储（agent_calls 表 / 内存列表）。"""
+        self._ensure_storage().store.record_agent_call(**record)
+
+    def list_agent_calls(self, run_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """查询某次运行的 Agent 调用记录。"""
+        return self._ensure_storage().store.list_agent_calls(run_id, limit)
+
     def _invoke_config(self, run: Run) -> dict[str, Any]:
         settings = self._settings
         recursion_limit = 4 * settings.max_routing_steps + 4 * settings.max_review_rounds + 8
@@ -184,6 +196,9 @@ class RunManager:
             "configurable": {"thread_id": run.thread_id},
             "recursion_limit": recursion_limit,
         }
+        if settings.parallel_agents:
+            # 允许 super-step 内并行节点真正并发执行
+            config["max_concurrency"] = 4
         if self._callbacks:
             config["callbacks"] = self._callbacks
         return config

@@ -13,11 +13,28 @@ from typing import Any
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from backend.tools import filter_tools
 
 
 class AgentOutputError(Exception):
     """Agent 未返回合法结构化输出时抛出。"""
+
+
+class RevisionItem(BaseModel):
+    """一个 Review 问题在本轮修订中的处理结果。"""
+
+    issue_id: str
+    status: str
+    changed_sections: list[str] = Field(default_factory=list)
+    resolution: str = ""
+
+
+class RevisionReport(BaseModel):
+    """节点修订时对 Reviewer 问题的逐项回应。"""
+
+    items: list[RevisionItem] = Field(default_factory=list)
 
 
 def get_mapping(source: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -50,11 +67,15 @@ class AgentSpec:
         return _default_state_update(self.task_id, data)
 
 
-def build_agent(spec: AgentSpec, model: BaseChatModel) -> Any:
-    """按 ``AgentSpec`` 装配 LangChain ``create_agent`` 子图。"""
+def build_agent(spec: AgentSpec, model: BaseChatModel, settings: Any | None = None) -> Any:
+    """按 ``AgentSpec`` 装配 LangChain ``create_agent`` 子图。
+
+    传入 ``settings`` 时，会按配置过滤工具（如未启用 Tavily 则不绑定 ``web_search``）。
+    """
+    tools = list(spec.tools) if settings is None else filter_tools(spec.tools, settings)
     return create_agent(
         model,
-        tools=list(spec.tools),
+        tools=tools,
         system_prompt=spec.system_prompt,
         response_format=spec.output_model,
         name=f"{spec.task_id}_agent",

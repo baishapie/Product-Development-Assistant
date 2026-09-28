@@ -21,6 +21,13 @@ _RESERVED = set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__.keys())
 _configured = False
 
 
+def _single_line(value: object) -> object:
+    """将日志字段压成单行，避免 Prompt 的换行破坏日志结构。"""
+    if not isinstance(value, str):
+        return value
+    return value.replace("\\r\\n", " ").replace("\\n", " ").replace("\r", " ").replace("\n", " ")
+
+
 class KeyValueFormatter(logging.Formatter):
     """标准格式 + ``key=value`` 形式追加 ``extra`` 字段。"""
 
@@ -33,7 +40,7 @@ class KeyValueFormatter(logging.Formatter):
         }
         if not extras:
             return base
-        suffix = " ".join(f"{key}={value}" for key, value in extras.items())
+        suffix = " ".join(f"{key}={_single_line(value)}" for key, value in extras.items())
         return f"{base} {suffix}"
 
 

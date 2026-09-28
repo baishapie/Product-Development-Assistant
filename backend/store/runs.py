@@ -11,7 +11,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from backend.config import Settings
@@ -42,9 +42,39 @@ CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
 """
 
+_AGENT_CALLS_DDL = """
+CREATE TABLE IF NOT EXISTS agent_calls (
+    id                BIGSERIAL PRIMARY KEY,
+    run_id            TEXT NOT NULL,
+    agent             TEXT NOT NULL,
+    attempt           INTEGER NOT NULL DEFAULT 1,
+    status            TEXT NOT NULL,
+    latency_ms        DOUBLE PRECISION,
+    input             TEXT,
+    output            TEXT,
+    error             TEXT,
+    model             TEXT,
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    total_tokens      INTEGER,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 兼容旧表：补齐 token/模型列（幂等）
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS model TEXT;
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER;
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS completion_tokens INTEGER;
+ALTER TABLE agent_calls ADD COLUMN IF NOT EXISTS total_tokens INTEGER;
+CREATE INDEX IF NOT EXISTS idx_agent_calls_run   ON agent_calls(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_calls_agent ON agent_calls(agent);
+"""
+
+
+# 应用侧默认展示时区：Asia/Shanghai（UTC+8），与 PG 会话时区保持一致
+CST = timezone(timedelta(hours=8))
+
 
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(CST).isoformat()
 
 
 @dataclass
@@ -62,7 +92,47 @@ class MemoryRunStore:
 
     def __init__(self) -> None:
         self._rows: dict[str, dict[str, Any]] = {}
+        self._calls: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+
+    def record_agent_call(
+        self,
+        run_id: str,
+        agent: str,
+        attempt: int,
+        status: str,
+        latency_ms: float | None = None,
+        input: str | None = None,  # noqa: A002 - 与表列名保持一致
+        output: str | None = None,
+        error: str | None = None,
+        model: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+    ) -> None:
+        with self._lock:
+            self._calls.append(
+                {
+                    "run_id": run_id,
+                    "agent": agent,
+                    "attempt": attempt,
+                    "status": status,
+                    "latency_ms": latency_ms,
+                    "input": input,
+                    "output": output,
+                    "error": error,
+                    "model": model,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "created_at": _now(),
+                }
+            )
+
+    def list_agent_calls(self, run_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [dict(call) for call in self._calls if call["run_id"] == run_id]
+        return rows[-limit:]
 
     def init_schema(self) -> None:  # noqa: D401 - 接口占位
         """内存实现无需建表。"""
@@ -124,6 +194,7 @@ class PostgresRunStore:
             conninfo=dsn,
             min_size=min_size,
             max_size=max_size,
+            # 会话时区由 DSN 的 options 统一控制（见 infra/postgres.build_dsn）
             kwargs={"row_factory": dict_row},
             open=True,
         )
@@ -131,7 +202,53 @@ class PostgresRunStore:
     def init_schema(self) -> None:
         with self._pool.connection() as conn:
             conn.execute(_DDL)
+            conn.execute(_AGENT_CALLS_DDL)
         logger.info("postgres: runs schema ensured")
+
+    def record_agent_call(
+        self,
+        run_id: str,
+        agent: str,
+        attempt: int,
+        status: str,
+        latency_ms: float | None = None,
+        input: str | None = None,  # noqa: A002 - 与表列名保持一致
+        output: str | None = None,
+        error: str | None = None,
+        model: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+    ) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO agent_calls "
+                "(run_id, agent, attempt, status, latency_ms, input, output, error, "
+                "model, prompt_tokens, completion_tokens, total_tokens) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    run_id,
+                    agent,
+                    attempt,
+                    status,
+                    latency_ms,
+                    input,
+                    output,
+                    error,
+                    model,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                ),
+            )
+
+    def list_agent_calls(self, run_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM agent_calls WHERE run_id = %s ORDER BY id DESC LIMIT %s",
+                (run_id, limit),
+            ).fetchall()
+        return [self._normalize(dict(row)) for row in rows]
 
     def create(self, run_id: str, idea: str) -> None:
         with self._pool.connection() as conn:
@@ -159,11 +276,16 @@ class PostgresRunStore:
 
     @staticmethod
     def _normalize(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        """把时间字段统一为「会话时区」的 ISO 字符串（默认 Asia/Shanghai，UTC+8）。"""
         if not row:
             return row
         for key in ("created_at", "updated_at"):
             value = row.get(key)
-            if hasattr(value, "isoformat"):
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=UTC)
+                row[key] = value.astimezone(CST).isoformat()
+            elif hasattr(value, "isoformat"):
                 row[key] = value.isoformat()
         return row
 
