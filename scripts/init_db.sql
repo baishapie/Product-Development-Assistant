@@ -46,9 +46,11 @@ CREATE TABLE IF NOT EXISTS runs (
     error         TEXT,
     output_path   TEXT,
     review        JSONB,
+    workflow      JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS workflow JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
 
@@ -63,6 +65,7 @@ COMMENT ON COLUMN runs.completed    IS '已完成的任务列表，JSON 数组�
 COMMENT ON COLUMN runs.error        IS '失败信息；成功时为 NULL';
 COMMENT ON COLUMN runs.output_path  IS '生成文档的落盘路径（output/{run_id}/product_document.md）';
 COMMENT ON COLUMN runs.review       IS '待人工确认的视图数据，JSON：stage/round/max_rounds/artifact；无待确认时为 NULL';
+COMMENT ON COLUMN runs.workflow     IS '可恢复的工作流视图：stages/revision_queue/review/document/route 状态';
 COMMENT ON COLUMN runs.created_at   IS '创建时间（UTC）';
 COMMENT ON COLUMN runs.updated_at   IS '最近更新时间（UTC），每次状态变更刷新';
 

@@ -1,16 +1,11 @@
-"""MVP 工作流图：Supervisor 星型动态路由。
-
-``START → supervisor``；``supervisor`` 条件边按 ``next_action`` 分发到各节点；
-专家 / 闸门 / Reviewer 执行后统一回边到 ``supervisor``；``document → END``。
-任一节点最终失败置 ``status=failed``；路由步数超 ``MAX_ROUTING_STEPS`` 强制收敛。
-"""
+"""LangGraph wiring for the deterministic product-document workflow."""
 
 from __future__ import annotations
 
-import json
 import logging
-import random
+import re
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -18,604 +13,701 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel
 
 from backend.agents import (
     AGENT_SPECS,
-    REVIEWER_SPEC,
-    SUPERVISOR_SPEC,
-    AgentOutputError,
     AgentSpec,
+    ReviewResult,
     build_agent,
     extract_structured,
 )
-from backend.agents.context import MissingRequiredResult
-from backend.agents.registry import (
-    CONTROL_NODES,
-    GATED_TASKS,
-    allowed_nodes,
-    gate_nodes,
-    parallel_groups,
-    required_tasks,
-)
-from backend.agents.supervisor import POSSIBLE_NODES, resolve_plan
 from backend.config import Settings
 from backend.llm.chat_model import create_chat_model
-from backend.tools.consistency import check_consistency
 from backend.tools.document_generator import render_document, save_document
+from backend.workflow.catalog import WorkflowPlan, get_plan
 from backend.workflow.human_review import Reviewer, make_human_review
+from backend.workflow.invalidation import build_invalidation_update
+from backend.workflow.policy import Decision, artifact_snapshot, decide_next
 from backend.workflow.state import AgentState
 
 logger = logging.getLogger(__name__)
 
-# Agent 输入/输出日志的单条长度上限（超出截断并标注总长度）
-_IO_LIMIT = 8000
+REVIEWER_SPEC: AgentSpec = AGENT_SPECS["reviewer"]
+_SECRET_TOKEN_PATTERN = re.compile(r"(?i)\b(?:sk-[A-Za-z0-9_-]{6,}|Bearer\s+\S+)\b")
+_ERROR_MESSAGE_LIMIT = 500
 
 
-def _short_json(value: Any, limit: int = _IO_LIMIT) -> str:
-    text = json.dumps(value, ensure_ascii=False, default=str)
-    return text if len(text) <= limit else f"{text[:limit]}...(共 {len(text)} 字符)"
+def _safe_error_log_value(value: Any, settings: Settings) -> str | None:
+    """Return a bounded, single-line diagnostic value with configured keys redacted."""
+    if not isinstance(value, (str, int, float)):
+        return None
+
+    text = str(value)
+    for name in ("llm_api_key", "openai_api_key", "deepseek_api_key", "qwen_api_key"):
+        secret = getattr(settings, name, None)
+        if isinstance(secret, str) and secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = _SECRET_TOKEN_PATTERN.sub("[REDACTED]", text)
+    return " ".join(text.split())[:_ERROR_MESSAGE_LIMIT]
 
 
-def _short_text(value: str, limit: int = _IO_LIMIT) -> str:
-    """按普通文本截断，避免日志层再次转义引号和换行。"""
-    return value if len(value) <= limit else f"{value[:limit]}...(共 {len(value)} 字符)"
+def _provider_error_log_fields(exc: Exception, settings: Settings) -> dict[str, Any]:
+    """Extract only safe, useful fields from an OpenAI-compatible API error body."""
+    fields: dict[str, Any] = {}
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        fields["http_status"] = status_code
+
+    body = getattr(exc, "body", None)
+    if not isinstance(body, Mapping):
+        return fields
+
+    error_body = body.get("error", body)
+    if isinstance(error_body, str):
+        message = error_body
+        error_body = {}
+    elif not isinstance(error_body, Mapping):
+        return fields
+    else:
+        message = error_body.get("message")
+
+    for source_key, log_key in (
+        ("code", "provider_error_code"),
+        ("type", "provider_error_type"),
+        ("param", "provider_error_param"),
+    ):
+        value = _safe_error_log_value(error_body.get(source_key), settings)
+        if value is not None:
+            fields[log_key] = value
+
+    safe_message = _safe_error_log_value(message, settings)
+    if safe_message:
+        fields["provider_error_message"] = safe_message
+    return fields
 
 
-def _extract_usage(output: Any) -> dict[str, int | None]:
-    """从 Agent 子图输出中汇总 token 用量（LangChain ``usage_metadata``）。
-
-    工具循环可能产生多条 AI 消息，逐条累加；无用量信息时返回全 None。
-    """
-    messages = output.get("messages") if isinstance(output, dict) else None
-    prompt = completion = total = 0
-    found = False
-    for message in messages or []:
-        usage = getattr(message, "usage_metadata", None)
-        if not usage:
-            continue
-        found = True
-        prompt += int(usage.get("input_tokens") or 0)
-        completion += int(usage.get("output_tokens") or 0)
-        total += int(usage.get("total_tokens") or 0)
-    if not found:
-        return {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+def _safe_error_summary(exc: Exception) -> str:
+    """Keep detailed provider diagnostics in local logs, not run/API error payloads."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return f"{type(exc).__name__} (HTTP {status_code})"
+    return type(exc).__name__
 
 
-# Supervisor 可路由到的节点（所有集合的超集 + 并行控制节点；实际映射在 build_graph 中按配置收敛）
-ROUTABLE_NODES: tuple[str, ...] = tuple(
-    dict.fromkeys([*(node for node in POSSIBLE_NODES if node != "end"), *CONTROL_NODES])
-)
 
-# 闸门阶段 -> 对应任务（仅对配置了闸门的任务生效）
-STAGE_TASK: dict[str, str] = {task: task for task in GATED_TASKS}
-# 已通过/跳过的闸门状态
-_RESOLVED = ("approved", "skipped")
-
-
-def allowed_next(state: AgentState, settings: Settings) -> list[str]:
-    """依据状态计算合法的下一节点候选（确定性，保证收敛）。"""
-    if state.get("status") == "failed":
-        return ["end"]
-    if state.get("review_decision") == "revise":
-        stage = state.get("review_stage")
-        # 可回退到任一专家（人工闸门阶段 + 全部计划任务，含 backend/frontend/qa）
-        revisable = set(STAGE_TASK) | set(required_tasks(settings))
-        return [stage] if stage in revisable else ["end"]
-
-    plan = list(state.get("plan") or [])
-    if not plan:
-        # 首轮：尚未规划，允许在本集合的计划任务中选择
-        return list(required_tasks(settings))
-
-    completed = set(state.get("completed") or [])
-    gate_status = state.get("gate_status") or {}
-    # 已执行但闸门未决的任务优先进入闸门
-    for stage, task in STAGE_TASK.items():
-        if task in completed and gate_status.get(stage) not in _RESOLVED:
-            return [f"review_{stage}"]
-    # 计划中尚未完成的任务（按计划顺序）
-    pending = [task for task in plan if task not in completed]
-    # 并行组全部待执行 → 交给 fanout 同时分发（同一步并发）
-    pending_set = set(pending)
-    for group in parallel_groups(settings):
-        if set(group) <= pending_set:
-            return ["fanout"]
-    if pending:
-        return pending
-    # 全部任务与人工闸门完成 → 自动评审
-    if gate_status.get("reviewer") not in _RESOLVED:
-        return ["reviewer"]
-    if not state.get("product_document"):
-        return ["document"]
-    return ["end"]
-
-
-def _choose_next(requested: str, candidates: list[str]) -> str:
-    """在候选集内选择；非法值回退确定性策略（取候选首项）。"""
-    if requested in candidates:
-        return requested
-    logger.warning("illegal next=%r, fallback to %r", requested, candidates[0])
-    return candidates[0]
-
-
-def _finalize_supervisor(
-    update: dict[str, Any],
-    candidates: list[str],
-    iteration: int,
-    settings: Settings,
-    strategy: str,
-) -> dict[str, Any]:
-    """应用路由步数护栏并记录日志（快路径与 LLM 路径共用）。"""
-    if iteration > settings.max_routing_steps:
-        # 强制收敛：可产出则走文档，否则失败结束
-        if "document" in candidates:
-            update["next_action"] = "document"
-        else:
-            logger.error("routing step limit exceeded", extra={"iteration": iteration})
-            update["next_action"] = "end"
-            update["status"] = "failed"
-            update["error"] = "routing step limit exceeded"
-    logger.info(
-        "supervisor route",
-        extra={"next": update["next_action"], "iteration": iteration, "strategy": strategy},
-    )
-    return update
-
-
-# 不可重试的 HTTP 状态（配置/鉴权/请求错误，重试无益）
-_NON_RETRIABLE_STATUS = {400, 401, 403, 404, 422}
-
-
-def _status_code(exc: Exception) -> int | None:
-    """从异常中提取 HTTP 状态码（openai/LangChain 通常挂在 status_code 上）。"""
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        response = getattr(exc, "response", None)
-        status = getattr(response, "status_code", None)
-    return int(status) if isinstance(status, int) else None
-
-
-def _is_retriable(exc: Exception) -> bool:
-    """判断异常是否值得重试：429/5xx 及无状态码（网络/超时/结构缺失）可重试。"""
-    if isinstance(exc, MissingRequiredResult):
-        return False
-    status = _status_code(exc)
-    if status is None:
-        return True
-    return status >= 500 or status == 429
-
-
-def _backoff_seconds(attempt: int, settings: Settings) -> float:
-    """指数退避 + 抖动（上限 ``RETRY_BACKOFF_MAX_SECONDS``）。"""
-    base = getattr(settings, "retry_backoff_base_seconds", 2.0)
-    cap = getattr(settings, "retry_backoff_max_seconds", 20.0)
-    delay = min(base * (2 ** attempt), cap)
-    return delay * (0.5 + random.random() * 0.5)
-
-
-def _record_agent_call(
+def _notify_agent_call(
     callback: Any | None,
     state: AgentState,
-    agent: str,
+    spec: AgentSpec,
     attempt: int,
     status: str,
     latency_ms: float,
-    input_text: str,
+    prompt: str,
     output_text: str | None,
     error: str | None,
-    model: str | None = None,
-    usage: dict[str, int | None] | None = None,
+    settings: Settings,
 ) -> None:
-    """把一次 Agent 调用（含 token 用量）写入回调（如 agent_calls 表）。"""
     if callback is None:
         return
-    usage = usage or {}
     try:
         callback(
             {
-                "run_id": state.get("run_id"),
-                "agent": agent,
-                "attempt": attempt + 1,
+                "run_id": str(state.get("run_id") or ""),
+                "agent": spec.task_id,
+                "attempt": attempt,
                 "status": status,
                 "latency_ms": latency_ms,
-                "input": input_text,
+                "input": prompt,
                 "output": output_text,
                 "error": error,
-                "model": model,
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
+                "model": getattr(settings, "llm_model", None),
             }
         )
-    except Exception:  # noqa: BLE001 - 记录失败不影响主流程
-        logger.warning("record agent call failed", exc_info=True)
+    except Exception:
+        logger.exception("agent call observer failed", extra={"agent": spec.task_id})
 
 
-def _make_structured_fallback(model: Any, output_model: Any) -> Any | None:
-    """构建"结构化输出兜底"Runnable；不支持时返回 None。"""
-    try:
-        return model.with_structured_output(output_model)
-    except Exception:  # noqa: BLE001 - 兜底不可用不影响主流程
-        logger.warning("structured fallback unavailable", extra={"schema": output_model.__name__})
-        return None
-
-
-def _run_structured_fallback(
-    structured_fallback: Any | None, out: Any, prompt: str, spec: AgentSpec
-) -> Any:
-    """主调用缺少 structured_response 时的兜底：用 with_structured_output 再取一次。"""
-    if structured_fallback is None:
-        raise AgentOutputError(f"{spec.output_model.__name__}: no structured_response")
-    logger.info("agent structured fallback", extra={"agent": spec.task_id})
-    pieces = [prompt]
-    messages = out.get("messages") if isinstance(out, dict) else None
-    for message in messages or []:
-        if getattr(message, "type", None) == "ai":
-            content = getattr(message, "content", None)
-            if isinstance(content, str) and content.strip():
-                pieces.append(f"你此前的回答（请据此整理为结构化结果）：\n{content}")
-    pieces.append("请仅返回符合要求的结构化 JSON，不要输出解释或代码围栏。")
-    return structured_fallback.invoke([{"role": "user", "content": "\n\n".join(pieces)}])
-
-
-def _structured_result(
-    out: Any, spec: AgentSpec, prompt: str, structured_fallback: Any | None
-) -> Any:
-    """先按子图结构化结果取值；缺失则走兜底。"""
-    try:
-        return extract_structured(out, spec.output_model)
-    except AgentOutputError:
-        return _run_structured_fallback(structured_fallback, out, prompt, spec)
-
-
-def _invoke_with_retries(
+def _invoke_structured(
     agent: Any,
     spec: AgentSpec,
     state: AgentState,
     settings: Settings,
-    on_agent_call: Any | None = None,
-    structured_fallback: Any | None = None,
-) -> tuple[Any, int, Exception | None]:
-    """调用 Agent 子图并解析结构化输出，按 ``AGENT_MAX_RETRIES`` 分层重试。
+    callback: Any | None,
+) -> tuple[BaseModel | None, int, str | None]:
+    prompt = spec.build_input(state)
+    max_attempts = max(1, int(getattr(settings, "agent_max_retries", 1)) + 1)
+    last_error: str | None = None
 
-    分层策略：结构化缺失先走兜底（``structured_fallback``）；异常按可重试性分类，
-    不可重试（4xx 配置/鉴权）立即失败；可重试则指数退避 + 抖动，并受节点 deadline 约束。
-    """
-    attempts = settings.agent_max_retries + 1
-    deadline = time.perf_counter() + getattr(settings, "agent_deadline_seconds", 180)
-    last_error: Exception | None = None
-    for attempt in range(attempts):
-        if attempt > 0 and time.perf_counter() >= deadline:
-            logger.warning("agent deadline exceeded", extra={"agent": spec.task_id})
-            break
-        started = time.perf_counter()
-        prompt = ""
+    for attempt in range(1, max_attempts + 1):
+        started = time.monotonic()
+        output: Any = None
         try:
-            prompt = spec.build_input(state)
-            logger.info(
-                "agent input",
-                extra={"agent": spec.task_id, "attempt": attempt + 1, "input": _short_text(prompt)},
+            output = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+            structured = extract_structured(output, spec.output_model)
+            _notify_agent_call(
+                callback,
+                state,
+                spec,
+                attempt,
+                "success",
+                (time.monotonic() - started) * 1000,
+                prompt,
+                repr(structured.model_dump(mode="json")),
+                None,
+                settings,
             )
-            out = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-            result = _structured_result(out, spec, prompt, structured_fallback)
-            latency = round((time.perf_counter() - started) * 1000, 1)
-            logger.info(
-                "agent done",
+            return structured, attempt, None
+        except Exception as exc:
+            last_error = _safe_error_summary(exc)
+            _notify_agent_call(
+                callback,
+                state,
+                spec,
+                attempt,
+                "failed",
+                (time.monotonic() - started) * 1000,
+                prompt,
+                repr(output) if output is not None else None,
+                last_error,
+                settings,
+            )
+            logger.warning(
+                "agent invocation failed",
                 extra={
+                    "run_id": str(state.get("run_id") or ""),
                     "agent": spec.task_id,
                     "attempt": attempt,
-                    "latency_ms": latency,
-                    "output": _short_json(result.model_dump()),
+                    "max_attempts": max_attempts,
+                    "exception_type": type(exc).__name__,
+                    **_provider_error_log_fields(exc, settings),
                 },
             )
-            _record_agent_call(
-                on_agent_call, state, spec.task_id, attempt, "ok", latency,
-                _short_text(prompt), _short_json(result.model_dump()), None,
-                model=settings.provider_config().model, usage=_extract_usage(out),
-            )
-            return result, attempt, None
-        except Exception as exc:  # noqa: BLE001 - 统一归一化失败并重试
-            last_error = exc
-            latency = round((time.perf_counter() - started) * 1000, 1)
-            logger.warning(
-                "agent attempt failed",
-                extra={
-                    "agent": spec.task_id,
-                    "attempt": attempt + 1,
-                    "latency_ms": latency,
-                    "error": str(exc),
-                },
-            )
-            _record_agent_call(
-                on_agent_call, state, spec.task_id, attempt, "failed", latency,
-                _short_text(prompt), None, str(exc),
-            )
-            if not _is_retriable(exc):
-                logger.error(
-                    "agent error not retriable",
-                    extra={"agent": spec.task_id, "error": str(exc)[:200]},
-                )
-                break
-            if attempt + 1 < attempts:
-                delay = _backoff_seconds(attempt, settings)
-                logger.info(
-                    "agent retry backoff",
-                    extra={"agent": spec.task_id, "delay_s": round(delay, 2)},
-                )
-                time.sleep(delay)
-    return None, attempts - 1, last_error
+            if attempt < max_attempts:
+                time.sleep(min(0.5 * (2 ** (attempt - 1)), 4.0))
+
+    return None, max_attempts, last_error
+
+
+def _current_inputs(state: AgentState, plan: WorkflowPlan, stage_id: str) -> dict[str, int]:
+    snapshot = artifact_snapshot(state, plan)
+    stage = plan.get(stage_id)
+    if stage is None:
+        raise ValueError(f"stage {stage_id!r} is not in workflow plan {plan.name!r}")
+    missing = [dependency for dependency in stage.depends_on if dependency not in snapshot]
+    if missing:
+        raise ValueError(f"stage {stage_id!r} has stale dependencies: {missing}")
+    return {dependency: snapshot[dependency] for dependency in stage.depends_on}
 
 
 def make_agent_node(
     spec: AgentSpec,
     model: BaseChatModel,
     settings: Settings,
+    plan: WorkflowPlan,
     on_agent_call: Any | None = None,
 ) -> Any:
-    """把专家 Agent 包成图节点：重试、写 results/completed、重置确认字段。"""
     agent = build_agent(spec, model, settings)
-    structured_fallback = _make_structured_fallback(model, spec.output_model)
 
     def node(state: AgentState) -> dict[str, Any]:
-        result, attempt, error = _invoke_with_retries(
-            agent, spec, state, settings, on_agent_call, structured_fallback
+        try:
+            input_versions = _current_inputs(state, plan, spec.task_id)
+        except ValueError as exc:
+            return {"status": "failed", "error": str(exc), "current_task": spec.task_id}
+
+        result, attempts, error = _invoke_structured(
+            agent, spec, state, settings, on_agent_call
         )
         if result is None:
-            logger.error("agent failed after retries", extra={"agent": spec.task_id})
             return {
                 "status": "failed",
-                "error": f"{spec.task_id}: {error}",
-                "retries": {spec.task_id: attempt},
+                "error": f"{spec.task_id} failed after {attempts} attempt(s): {error}",
                 "current_task": spec.task_id,
+                "retries": {spec.task_id: attempts},
             }
-        update = spec.build_state_update(result.model_dump())
-        update["retries"] = {spec.task_id: attempt}
-        update["current_task"] = spec.task_id
-        # 重置确认字段，使 revise 后重跑能再次进入闸门
-        update["review_decision"] = None
-        update["review_feedback"] = None
+
+        payload = result.model_dump(mode="json")
+        update = spec.build_state_update(payload)
+        update["results"] = {**(update.get("results") or {}), spec.task_id: payload}
+        current_snapshot = artifact_snapshot(state, plan)
+        current_snapshot[spec.task_id] = int(
+            (state.get("stages") or {}).get(spec.task_id, {}).get("artifact_version", 0)
+        ) + 1
+        update["completed"] = [
+            stage.stage_id for stage in plan.stages if stage.stage_id in current_snapshot
+        ]
+        previous = (state.get("stages") or {}).get(spec.task_id, {})
+        version = current_snapshot[spec.task_id]
+        gate_status = "pending" if plan.require(spec.task_id).gate_node else "not_required"
+        update.update(
+            {
+                "stages": {
+                    spec.task_id: {
+                        **previous,
+                        "status": "current",
+                        "artifact_version": version,
+                        "input_versions": input_versions,
+                        "gate_status": gate_status,
+                    }
+                },
+                "gate_status": {spec.task_id: gate_status},
+                "revision_queue": [
+                    stage_id
+                    for stage_id in (state.get("revision_queue") or [])
+                    if stage_id != spec.task_id
+                ],
+                "review_approved_snapshot": None,
+                "document_status": "stale",
+                "document_snapshot": {},
+                "status": "running",
+                "error": None,
+                "current_task": spec.task_id,
+                "retries": {spec.task_id: attempts},
+            }
+        )
         return update
 
     node.__name__ = f"{spec.task_id}_node"
     return node
 
 
-def make_supervisor_node(
-    model: BaseChatModel,
+def _invalidation_update(
+    state: AgentState,
+    plan: WorkflowPlan,
+    targets: list[str],
+) -> dict[str, Any]:
+    update = build_invalidation_update(state, targets, plan)
+    gate_status = dict(state.get("gate_status") or {})
+    for stage_id in (update.get("stages") or {}):
+        stage = plan.get(stage_id)
+        gate_status[stage_id] = "pending" if stage and stage.gate_node else "not_required"
+    update["gate_status"] = gate_status
+    return update
+
+
+def make_gate_node(
+    stage_id: str,
     settings: Settings,
-    spec: AgentSpec = SUPERVISOR_SPEC,
-    on_agent_call: Any | None = None,
+    plan: WorkflowPlan,
+    reviewer: Reviewer | None = None,
 ) -> Any:
-    """Supervisor 节点：首轮规划；每轮在候选集内选择并写 ``next_action``。"""
-    agent = build_agent(spec, model, settings)
-    structured_fallback = _make_structured_fallback(model, spec.output_model)
+    stage = plan.get(stage_id)
+    if stage is None or stage.gate_node is None:
+        raise ValueError(f"stage {stage_id!r} has no review gate")
+    gate = make_human_review(stage_id, settings, reviewer)
 
     def node(state: AgentState) -> dict[str, Any]:
-        if state.get("status") == "failed":
-            return {"next_action": "end", "current_task": "supervisor"}
+        update = gate(state)
+        if update.get("status") == "failed":
+            return update
+        if update.get("review_decision") != "revise":
+            return update
 
-        candidates = allowed_next(state, settings)
-        iteration = int(state.get("iteration_count") or 0) + 1
-
-        # 快路径：候选唯一且计划已生成 → 路由已确定，无需调用 LLM。
-        # 只返回流程控制字段，plan/results/review_* 等由状态合并原样保留（保证 Agent 间状态传递）。
-        if len(candidates) == 1 and state.get("plan"):
-            update: dict[str, Any] = {
-                "next_action": candidates[0],
-                "iteration_count": iteration,
-                "current_task": "supervisor",
+        rounds = int((update.get("review_rounds") or {}).get(stage_id, 0))
+        if rounds > settings.max_review_rounds:
+            return {
+                **update,
+                "status": "failed",
+                "error": f"{stage_id} review rounds exhausted with unresolved feedback",
             }
-            return _finalize_supervisor(update, candidates, iteration, settings, "deterministic")
-
-        # 首轮规划 / 多候选：调用 LLM 决策（仅此处会产生一次 LLM 调用）
-        prompt_state = {
-            **state,
-            "_required_tasks": required_tasks(settings),
-            "_allowed_next": candidates,
+        feedback = str(update.get("review_feedback") or "").strip()
+        issue = {
+            "issue_id": f"human-{stage_id}-{rounds}",
+            "target": stage_id,
+            "severity": "medium",
+            "category": "human_review",
+            "problem": feedback,
+            "acceptance_criteria": [feedback],
+            "suggestion": feedback,
+            "status": "open",
         }
-        decision, attempt, error = _invoke_with_retries(
-            agent, spec, prompt_state, settings, on_agent_call, structured_fallback
+        return {
+            **update,
+            **_invalidation_update(state, plan, [stage_id]),
+            "review_issues": [issue],
+            "review_issue_lists": {stage_id: [issue]},
+            "current_task": stage.gate_node,
+        }
+
+    node.__name__ = f"{stage.gate_node}_node"
+    return node
+
+
+def _review_issue_view(issue: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove Reviewer-only bookkeeping from a public issue payload."""
+    return {key: value for key, value in issue.items() if not key.startswith("_")}
+
+
+def _has_issue_evidence(issue: Mapping[str, Any]) -> bool:
+    """Only let actionable findings block when they have evidence and acceptance criteria."""
+    evidence = issue.get("evidence")
+    criteria = issue.get("acceptance_criteria")
+    return (
+        isinstance(evidence, list)
+        and any(isinstance(item, str) and item.strip() for item in evidence)
+        and isinstance(criteria, list)
+        and any(isinstance(item, str) and item.strip() for item in criteria)
+    )
+
+
+def make_reviewer_node(
+    model: BaseChatModel,
+    settings: Settings,
+    plan: WorkflowPlan,
+    on_agent_call: Any | None = None,
+) -> Any:
+    agent = build_agent(REVIEWER_SPEC, model, settings)
+
+    def node(state: AgentState) -> dict[str, Any]:
+        round_no = int((state.get("review_rounds") or {}).get("reviewer", 0)) + 1
+        result, attempts, error = _invoke_structured(
+            agent, REVIEWER_SPEC, state, settings, on_agent_call
         )
-        if decision is None:
+        if not isinstance(result, ReviewResult):
             return {
                 "status": "failed",
-                "error": f"supervisor: {error}",
-                "next_action": "end",
-                "current_task": "supervisor",
+                "error": f"reviewer failed after {attempts} attempt(s): {error}",
+                "current_task": "reviewer",
+                "retries": {"reviewer": attempts},
             }
-        update = spec.build_state_update(decision.model_dump())
-        if not state.get("plan"):
-            # 首轮必须落地计划（模型未给出合法 tasks 时回退默认顺序）
-            update["plan"] = resolve_plan(list(decision.tasks or []), required_tasks(settings))
-        update["next_action"] = _choose_next(decision.next, candidates)
-        update["iteration_count"] = iteration
-        update["current_task"] = "supervisor"
-        update["retries"] = {"supervisor": attempt}
-        return _finalize_supervisor(update, candidates, iteration, settings, "llm")
+
+        previous_ledger = {
+            str(issue_id): dict(issue)
+            for issue_id, issue in (state.get("review_issue_ledger") or {}).items()
+            if isinstance(issue, Mapping)
+        }
+        ledger = {issue_id: dict(issue) for issue_id, issue in previous_ledger.items()}
+        snapshot = artifact_snapshot(state, plan)
+        suggestions = list(result.suggestions)
+        seen_ids: set[str] = set()
+        duplicate_ids: set[str] = set()
+
+        for issue_model in result.issues:
+            issue = issue_model.model_dump(mode="json")
+            issue_id = str(issue.get("issue_id") or "").strip()
+            if not issue_id:
+                suggestions.append(
+                    f"未采纳一条阻塞发现：缺少稳定 issue_id（{issue.get('problem', '')}）"
+                )
+                continue
+            if issue_id in seen_ids:
+                duplicate_ids.add(issue_id)
+                continue
+            seen_ids.add(issue_id)
+            previous = previous_ledger.get(issue_id)
+            if previous is None:
+                if not _has_issue_evidence(issue):
+                    suggestions.append(
+                        f"未采纳无充分证据或验收条件的新问题 {issue_id}：{issue.get('problem', '')}"
+                    )
+                    continue
+                if issue.get("target") not in plan.stage_ids:
+                    return {
+                        "status": "failed",
+                        "error": (
+                            f"reviewer returned enabled-evidence issue {issue_id} for "
+                            f"stage outside this plan: {issue.get('target')}"
+                        ),
+                        "results": {"reviewer": result.model_dump(mode="json")},
+                        "review_result": result.model_dump(mode="json"),
+                        "current_task": "reviewer",
+                        "review_rounds": {"reviewer": round_no},
+                    }
+                # A newly discovered issue always starts open; it cannot be
+                # self-verified in the same response that first raises it.
+                issue["status"] = "open"
+                issue["verification_evidence"] = []
+                issue["_identified_target_version"] = snapshot.get(str(issue["target"]))
+                issue["_verification_failures"] = 0
+                issue["_revision_count"] = 0
+                ledger[issue_id] = issue
+                continue
+
+            previous_status = str(previous.get("status") or "open")
+            proposed_status = str(issue.get("status") or "open")
+            target = str(previous.get("target") or issue.get("target") or "")
+            if target not in plan.stage_ids:
+                return {
+                    "status": "failed",
+                    "error": f"reviewer ledger issue {issue_id} targets disabled stage {target}",
+                    "review_result": result.model_dump(mode="json"),
+                    "current_task": "reviewer",
+                    "review_rounds": {"reviewer": round_no},
+                }
+
+            if previous_status in {"verified", "closed"}:
+                # A resolved issue can only reopen after its target artifact changes and
+                # the reviewer supplies concrete evidence of a regression.
+                resolved_version = previous.get("_resolved_target_version")
+                current_version = snapshot.get(target)
+                regression_evidence = issue.get("evidence") or []
+                can_reopen = (
+                    proposed_status not in {"verified", "closed"}
+                    and current_version is not None
+                    and current_version != resolved_version
+                    and any(isinstance(item, str) and item.strip() for item in regression_evidence)
+                    and _has_issue_evidence(issue)
+                )
+                if can_reopen:
+                    reopened = dict(previous)
+                    reopened.update(
+                        {
+                            "status": "open",
+                            "evidence": regression_evidence,
+                            "verification_evidence": [],
+                            "_identified_target_version": current_version,
+                            "_verification_failures": 0,
+                            "_revision_count": 0,
+                        }
+                    )
+                    ledger[issue_id] = reopened
+                elif proposed_status not in {"verified", "closed"}:
+                    suggestions.append(
+                        f"已解决问题 {issue_id} 未满足重开条件，按非阻塞建议处理"
+                    )
+                continue
+
+            updated = dict(previous)
+            # Keep the original issue identity and routing target stable across rounds.
+            updated["target"] = target
+            if issue.get("evidence"):
+                updated["evidence"] = issue["evidence"]
+            updated["verification_evidence"] = issue.get("verification_evidence") or []
+            current_version = snapshot.get(target)
+            artifact_was_revised = (
+                current_version is not None
+                and current_version != previous.get("_identified_target_version")
+            )
+            if (
+                previous_status == "revision_submitted"
+                and artifact_was_revised
+                and proposed_status in {"verified", "closed"}
+                and any(
+                    isinstance(item, str) and item.strip()
+                    for item in updated["verification_evidence"]
+                )
+            ):
+                updated["status"] = proposed_status
+                updated["_resolved_target_version"] = snapshot.get(target)
+                updated["_verification_failures"] = 0
+            else:
+                updated["status"] = "unresolved"
+                if previous_status == "revision_submitted":
+                    updated["_verification_failures"] = int(
+                        previous.get("_verification_failures") or 0
+                    ) + 1
+            ledger[issue_id] = updated
+
+        if duplicate_ids:
+            return {
+                "status": "failed",
+                "error": f"reviewer returned duplicate issue_id(s): {sorted(duplicate_ids)}",
+                "review_result": result.model_dump(mode="json"),
+                "review_rounds": {"reviewer": round_no},
+                "current_task": "reviewer",
+            }
+
+        # Omission is not evidence of resolution. Carry each prior blocker forward;
+        # if a revision had already been submitted, count this as a failed verification.
+        for issue_id, previous in previous_ledger.items():
+            if issue_id in seen_ids:
+                continue
+            status = str(previous.get("status") or "open")
+            if status in {"verified", "closed"}:
+                continue
+            carried = dict(previous)
+            carried["status"] = "unresolved"
+            if status == "revision_submitted":
+                carried["_verification_failures"] = int(
+                    previous.get("_verification_failures") or 0
+                ) + 1
+            ledger[issue_id] = carried
+
+        all_issues = [_review_issue_view(issue) for issue in ledger.values()]
+        blocking = [
+            issue for issue in ledger.values()
+            if issue.get("status") not in {"verified", "closed"}
+        ]
+        blocking.sort(
+            key=lambda issue: (
+                plan.stage_ids.index(str(issue.get("target")))
+                if issue.get("target") in plan.stage_ids
+                else len(plan.stage_ids),
+                {"high": 0, "medium": 1, "low": 2}.get(str(issue.get("severity")), 1),
+            )
+        )
+        issue_lists = {
+            stage_id: [
+                _review_issue_view(issue)
+                for issue in blocking
+                if issue.get("target") == stage_id
+            ]
+            for stage_id in plan.stage_ids
+        }
+        payload = result.model_dump(mode="json")
+        payload["issues"] = all_issues
+        payload["suggestions"] = list(dict.fromkeys(suggestions))
+        payload["approved"] = not blocking
+        payload["target"] = blocking[0]["target"] if blocking else None
+        state_update: dict[str, Any] = {
+            "results": {"reviewer": payload},
+            "review_result": payload,
+            "review_issue_ledger": ledger,
+            "review_issues": all_issues,
+            "review_issue_lists": issue_lists,
+            "review_rounds": {"reviewer": round_no},
+            "current_task": "reviewer",
+            "retries": {"reviewer": attempts},
+        }
+
+        non_converging = [
+            str(issue.get("issue_id"))
+            for issue in blocking
+            if int(issue.get("_verification_failures") or 0) >= 2
+        ]
+        if non_converging:
+            return {
+                **state_update,
+                "status": "failed",
+                "review_status": "failed",
+                "error": (
+                    "reviewer_not_converging: issue(s) "
+                    + ", ".join(non_converging)
+                    + " remained unresolved in two consecutive verification rounds"
+                ),
+            }
+
+        if not blocking:
+            return {
+                **state_update,
+                "review_status": "approved",
+                "review_stage": None,
+                "review_approved_snapshot": snapshot,
+                "revision_queue": [],
+                "review_decision": "approved",
+                "review_feedback": None,
+            }
+
+        # MAX_REVIEW_ROUNDS bounds revision cycles. A final verification pass is
+        # still allowed after the last permitted revision.
+        revisions_already_submitted = round_no - 1
+        if revisions_already_submitted >= settings.max_review_rounds:
+            return {
+                **state_update,
+                "status": "failed",
+                "review_status": "failed",
+                "error": "max_review_rounds_exceeded: unresolved Reviewer issues remain",
+            }
+
+        targets = list(dict.fromkeys(str(issue["target"]) for issue in blocking))
+        for issue in blocking:
+            issue_id = str(issue["issue_id"])
+            queued = dict(ledger[issue_id])
+            queued["status"] = "revision_submitted"
+            queued["_revision_count"] = int(queued.get("_revision_count") or 0) + 1
+            ledger[issue_id] = queued
+        state_update["review_issue_ledger"] = ledger
+        state_update["review_issues"] = [
+            _review_issue_view(issue) for issue in ledger.values()
+        ]
+        state_update["review_result"]["issues"] = state_update["review_issues"]
+        state_update["results"]["reviewer"]["issues"] = state_update["review_issues"]
+        feedback = "\n".join(
+            str(issue.get("problem") or "").strip()
+            for issue in blocking
+            if str(issue.get("problem") or "").strip()
+        )
+        state_update.update(
+            {
+                "review_decision": "revise",
+                "review_stage": targets[0],
+                "review_feedback": feedback or "Reviewer requested a revision.",
+                "review_status": "needs_revision",
+                **_invalidation_update(state, plan, targets),
+            }
+        )
+        return state_update
+
+    node.__name__ = "reviewer_node"
+    return node
+
+
+def make_supervisor_node(settings: Settings, plan: WorkflowPlan) -> Any:
+    def node(state: AgentState) -> dict[str, Any]:
+        decision: Decision = decide_next(
+            state,
+            plan,
+            max_routing_steps=int(getattr(settings, "max_routing_steps", 100)),
+        )
+        update: dict[str, Any] = {
+            "plan": list(plan.stage_ids),
+            "next_action": decision.target,
+            "route_decision": {
+                "target": decision.target,
+                "action": decision.action,
+                "reason": decision.reason,
+                "stage_id": decision.stage_id,
+            },
+            "iteration_count": int(state.get("iteration_count") or 0) + 1,
+            "current_task": "supervisor",
+        }
+        if decision.action == "fail":
+            update.update(
+                {
+                    "status": "failed",
+                    "error": decision.reason,
+                    "next_action": "end",
+                }
+            )
+        elif decision.action == "terminate":
+            if decision.reason == "workflow_complete":
+                update["status"] = "done"
+            update["next_action"] = "end"
+        return update
 
     node.__name__ = "supervisor_node"
     return node
 
 
-_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+def allowed_next(state: AgentState, settings: Settings) -> list[str]:
+    """Compatibility wrapper returning the deterministic Supervisor's single choice."""
+    plan = get_plan(settings.agent_set)
+    decision = decide_next(
+        state,
+        plan,
+        max_routing_steps=int(getattr(settings, "max_routing_steps", 100)),
+    )
+    return [decision.target]
 
 
-def _pick_target(issues: list[Any]) -> str:
-    """按严重度选择最该回退的目标（high > medium > low，同级取先出现者）。"""
-    valid = [issue for issue in issues if getattr(issue, "target", None)]
-    if not valid:
-        return "architect"
-    best = min(valid, key=lambda issue: _SEVERITY_ORDER.get(issue.severity, 3))
-    return best.target
+def route_supervisor(state: AgentState) -> str:
+    return str(state.get("next_action") or "end")
 
 
-def _issue_payload(issue: Any, index: int) -> dict[str, Any]:
-    """把确定性或旧版问题统一成 ReviewIssue 兼容的字典。"""
-    if hasattr(issue, "model_dump"):
-        payload = issue.model_dump()
-    elif isinstance(issue, dict):
-        payload = dict(issue)
-    else:
-        payload = {"problem": str(issue)}
-    payload.setdefault("issue_id", f"CONSISTENCY-{index:03d}")
-    payload.setdefault("target", "architect")
-    payload.setdefault("severity", "medium")
-    payload.setdefault("category", "consistency")
-    payload.setdefault("acceptance_criteria", [payload.get("problem", "请修复该问题")])
-    payload.setdefault("suggestion", payload.get("problem", "请修复该问题"))
-    payload.setdefault("status", "open")
-    return payload
-
-
-def make_reviewer_node(
-    spec: AgentSpec,
-    model: BaseChatModel,
-    settings: Settings,
-    on_agent_call: Any | None = None,
-) -> Any:
-    """Reviewer 节点：先做规则化一致性硬校验，再（无硬问题时）调用 LLM 语义评审。"""
-    agent = build_agent(spec, model, settings)
-    structured_fallback = _make_structured_fallback(model, spec.output_model)
-
+def make_document_node(settings: Settings, plan: WorkflowPlan) -> Any:
     def node(state: AgentState) -> dict[str, Any]:
-        rounds = int((state.get("review_rounds") or {}).get(spec.task_id, 0))
-
-        # 规则化硬校验：有确定性问题 → 直接回退到对应 Agent（不调用 LLM）
-        issues = check_consistency(state.get("results") or {})
-        if issues and rounds < settings.max_review_rounds:
-            target = _pick_target(issues)
-            structured_issues = [_issue_payload(issue, index) for index, issue in enumerate(issues, 1)]
-            details = [str(issue.get("problem") or issue.get("detail")) for issue in structured_issues]
-            logger.info(
-                "reviewer consistency gate",
-                extra={"target": target, "count": len(details)},
-            )
-            return {
-                "results": {
-                    spec.task_id: {
-                        "approved": False,
-                        "target": target,
-                        "score": 0,
-                        "issues": structured_issues,
-                        "suggestions": [f"请修正：{detail}" for detail in details],
-                    }
-                },
-                "current_task": spec.task_id,
-                "retries": {spec.task_id: 0},
-                "review_stage": target,
-                "review_decision": "revise",
-                "review_feedback": "；".join(details),
-                "review_issues": structured_issues,
-                "review_rounds": {spec.task_id: rounds + 1},
-                "gate_status": {spec.task_id: "revise"},
-            }
-
-        result, attempt, error = _invoke_with_retries(
-            agent, spec, state, settings, on_agent_call, structured_fallback
-        )
-        if result is None:
+        snapshot = artifact_snapshot(state, plan)
+        approved = dict(state.get("review_approved_snapshot") or {})
+        if state.get("review_status") != "approved" or approved != snapshot:
             return {
                 "status": "failed",
-                "error": f"{spec.task_id}: {error}",
-                "next_action": "end",
-                "current_task": spec.task_id,
+                "error": "refusing to write a document from an unapproved or stale snapshot",
+                "current_task": "document",
             }
-
-        update: dict[str, Any] = {
-            "results": {spec.task_id: result.model_dump()},
-            "current_task": spec.task_id,
-            "retries": {spec.task_id: attempt},
-        }
-        issue_payloads = [issue.model_dump() for issue in result.issues]
-        if result.approved or rounds >= settings.max_review_rounds:
-            update.update(
-                {
-                    "review_stage": spec.task_id,
-                    "review_decision": "approved",
-                    "review_feedback": None,
-                    "review_issues": issue_payloads,
-                    "gate_status": {spec.task_id: "approved"},
-                }
-            )
-            logger.info("reviewer approved", extra={"agent": spec.task_id, "rounds": rounds})
-            return update
-
-        feedback = "；".join(
-            [
-                *[issue.problem for issue in result.issues],
-                *result.suggestions,
-            ]
-        ) or "评审未通过"
-        target = result.target or (result.issues[0].target if result.issues else "architect")
-        update.update(
-            {
-                "review_stage": target,
-                "review_decision": "revise",
-                "review_feedback": feedback,
-                "review_issues": issue_payloads,
-                "review_rounds": {spec.task_id: rounds + 1},
-                "gate_status": {spec.task_id: "revise"},
-            }
-        )
-        logger.info(
-            "reviewer revise",
-            extra={"agent": spec.task_id, "target": target, "round": rounds + 1},
-        )
-        return update
-
-    node.__name__ = f"{spec.task_id}_node"
-    return node
-
-
-def make_fanout_node(settings: Settings) -> Any:
-    """并行分发节点：透传；其出边触发同组多个成员（同一 super-step 并发）。"""
-
-    def node(state: AgentState) -> dict[str, Any]:
-        logger.info("fanout dispatch")
-        return {"current_task": "fanout"}
-
-    node.__name__ = "fanout_node"
-    return node
-
-
-def make_join_node(settings: Settings) -> Any:
-    """并行汇合节点：等同组所有成员完成后回 Supervisor。"""
-
-    def node(state: AgentState) -> dict[str, Any]:
-        logger.info("fanout join")
-        return {"current_task": "join"}
-
-    node.__name__ = "join_node"
-    return node
-
-
-def make_document_node(settings: Settings) -> Any:
-    """文档节点：渲染固定模板并落盘，置 ``status=done``。"""
-
-    def node(state: AgentState) -> dict[str, Any]:
         content = render_document(state)
-        # 按任务分目录，避免多任务互相覆盖
         run_id = str(state.get("run_id") or "default")
         path = save_document(content, Path(settings.output_dir) / run_id)
-        logger.info("document written", extra={"path": str(path)})
         return {
             "product_document": content,
             "output_path": str(path),
+            "document_status": "current",
+            "document_snapshot": snapshot,
             "status": "done",
             "current_task": "document",
         }
 
     node.__name__ = "document_node"
     return node
-
-
-def route_supervisor(state: AgentState) -> str:
-    """Supervisor 条件边：按 ``next_action`` 分发；非法/缺失则结束。"""
-    target = state.get("next_action")
-    if target in ROUTABLE_NODES:
-        return target
-    return END
 
 
 def build_graph(
@@ -625,63 +717,39 @@ def build_graph(
     checkpointer: Any | None = None,
     on_agent_call: Any | None = None,
 ) -> CompiledStateGraph:
-    """按 ``settings.agent_set`` 组装并编译工作流图。
-
-    节点集合由 `backend/agents/registry.py` 决定（mvp/full），
-    与 ``allowed_next``/``resolve_plan`` 同源。
-    ``checkpointer`` 缺省为内存 ``MemorySaver``（测试友好）；
-    生产由 ``RunManager`` 注入 ``PostgresSaver`` 以支持断点续跑。
-    """
+    """Build the configured MVP or Full star graph with a deterministic Supervisor."""
+    plan = get_plan(settings.agent_set)
     client = model or create_chat_model(settings)
-
-    # 按 AGENT_SET 决定要跑哪些专家与闸门（与 allowed_next / resolve_plan 同源）
-    tasks = required_tasks(settings)
-    gates = gate_nodes(settings)
-    groups = parallel_groups(settings)
-    parallel_members = {member for group in groups for member in group}
-    routable = tuple(node for node in allowed_nodes(settings) if node != "end")
-
     graph: StateGraph = StateGraph(AgentState)
-    graph.add_node(
-        "supervisor",
-        make_supervisor_node(client, settings, on_agent_call=on_agent_call),
-    )
-    for task in tasks:
-        spec = AGENT_SPECS.get(task)
+    graph.add_node("supervisor", make_supervisor_node(settings, plan))
+
+    routed_nodes: list[str] = ["reviewer", "document"]
+    for stage in plan.stages:
+        spec = AGENT_SPECS.get(stage.node)
         if spec is None:
-            raise ValueError(
-                f"agent {task!r} required by AGENT_SET={settings.agent_set!r} has no AgentSpec"
+            raise ValueError(f"stage {stage.stage_id!r} has no registered AgentSpec")
+        graph.add_node(
+            stage.node,
+            make_agent_node(spec, client, settings, plan, on_agent_call),
+        )
+        routed_nodes.append(stage.node)
+        if stage.gate_node:
+            graph.add_node(
+                stage.gate_node,
+                make_gate_node(stage.stage_id, settings, plan, reviewer),
             )
-        graph.add_node(task, make_agent_node(spec, client, settings, on_agent_call))
-    graph.add_node(
-        "reviewer",
-        make_reviewer_node(REVIEWER_SPEC, client, settings, on_agent_call),
-    )
-    for task, gate in GATED_TASKS.items():
-        if gate in gates:
-            graph.add_node(gate, make_human_review(task, settings, reviewer))
-    graph.add_node("document", make_document_node(settings))
+            routed_nodes.append(stage.gate_node)
 
-    if groups:
-        # 并行：supervisor → fanout →（成员并发）→ join → supervisor
-        graph.add_node("fanout", make_fanout_node(settings))
-        graph.add_node("join", make_join_node(settings))
-        for group in groups:
-            for member in group:
-                graph.add_edge("fanout", member)
-            graph.add_edge(list(group), "join")
-        graph.add_edge("join", "supervisor")
-
+    graph.add_node("reviewer", make_reviewer_node(client, settings, plan, on_agent_call))
+    graph.add_node("document", make_document_node(settings, plan))
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges(
         "supervisor",
         route_supervisor,
-        {**{node: node for node in routable}, END: END},
+        {**{node: node for node in routed_nodes}, "end": END},
     )
-    for node in (*tasks, *gates, "reviewer"):
-        if node in parallel_members:
-            continue
-        graph.add_edge(node, "supervisor")
+    for node_name in routed_nodes:
+        if node_name != "document":
+            graph.add_edge(node_name, "supervisor")
     graph.add_edge("document", END)
-
     return graph.compile(checkpointer=checkpointer or MemorySaver())

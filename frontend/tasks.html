@@ -57,6 +57,15 @@
       .chip { border-radius: 8px; padding: 4px 10px; background: #f1f5f9; color: #475569; font-size: 13px; }
       .chip.done { background: #d1fae5; color: #047857; }
       .chip.running { background: #dbeafe; color: #1d4ed8; }
+      .chip.stale { background: #ffedd5; color: #c2410c; }
+      .stage-summary { margin-top: 12px; overflow-x: auto; }
+      .stage-summary table { width: 100%; border-collapse: collapse; min-width: 620px; }
+      .stage-summary th, .stage-summary td { border-bottom: 1px solid var(--border); padding: 7px 8px; text-align: left; vertical-align: top; }
+      .stage-summary th { color: var(--muted); font-size: 12px; font-weight: 600; }
+      .stage-state { font-size: 12px; font-weight: 600; white-space: nowrap; }
+      .stage-state.current { color: var(--green); }
+      .stage-state.stale { color: var(--amber); }
+      .stage-state.pending { color: var(--muted); }
       .chip.disabled { background: #f8fafc; color: #94a3b8; text-decoration: line-through; }
       pre.artifact { background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px; max-height: 280px; overflow: auto; font-size: 12px; }
       .markdown h1 { font-size: 20px; }
@@ -114,7 +123,11 @@
         </div>
         <div id="detail-idea" style="margin-bottom: 6px"></div>
         <div id="detail-meta" class="muted"></div>
+        <div id="detail-route" class="muted"></div>
+        <div id="detail-auto-review" class="muted"></div>
+        <div id="detail-revision" class="muted hidden"></div>
         <div id="detail-plan" class="chips"></div>
+        <div id="detail-stage-summary" class="stage-summary hidden"></div>
         <div id="detail-error" class="error hidden" style="margin-top: 10px"></div>
 
         <div id="review-box" class="hidden" style="margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px">
@@ -147,7 +160,7 @@
         product: "需求确认", architect: "技术方案确认",
         backend: "后端设计", frontend: "前端设计", qa: "测试方案",
       };
-      var state = { list: [], selected: "", timer: null, docLoading: false };
+      var state = { list: [], selected: "", timer: null, docLoadingFor: "", docLoadedFor: "" };
 
       function el(id) { return document.getElementById(id); }
       function setError(msg) {
@@ -263,7 +276,8 @@
       function selectRun(runId) {
         setError("");
         state.selected = runId;
-        state.docLoading = false;
+        state.docLoadingFor = "";
+        state.docLoadedFor = "";
         el("doc").innerHTML = "";
         renderList();
         show("detail", true);
@@ -280,31 +294,146 @@
           .catch(function (err) { setError(String(err)); });
       }
 
+      function stageIsCurrent(data, stageId, completed) {
+        var stages = data.stages || {};
+        var info = stages[stageId];
+        if (info) {
+          return info.status === "current" && completed.indexOf(stageId) !== -1;
+        }
+        // Older persisted runs do not have versioned stage metadata.
+        return Object.keys(stages).length === 0 && completed.indexOf(stageId) !== -1;
+      }
+
+      function nodeIsDone(data, node, completed) {
+        if (node === "supervisor") return false;
+        if (node === "reviewer") return data.review_status === "approved";
+        if (node === "document") return data.document_status === "current";
+        if (node.indexOf("review_") === 0) {
+          var stageId = node.slice("review_".length);
+          var stage = (data.stages || {})[stageId];
+          if (stage) {
+            return stage.status === "current" && stage.gate_status === "approved";
+          }
+          return Object.keys(data.stages || {}).length === 0 &&
+            completed.indexOf(node) !== -1;
+        }
+        return stageIsCurrent(data, node, completed);
+      }
+
+      function nodeIsStale(data, node) {
+        if (node === "reviewer") return data.review_status === "needs_revision";
+        if (node === "document") return data.document_status === "stale";
+        var stageId = node.indexOf("review_") === 0 ? node.slice("review_".length) : node;
+        var stage = (data.stages || {})[stageId];
+        return !!stage && stage.status === "stale";
+      }
+
       function renderDetail(data) {
         el("detail-id").textContent = "run_id: " + data.run_id;
         var badge = el("detail-status");
         badge.textContent = STATUS_TEXT[data.status] || data.status;
         badge.className = "badge " + data.status;
         el("detail-idea").textContent = data.idea || "";
-        el("detail-meta").textContent = "当前节点：" + (data.current_task || "-");
+
+        var currentTask = data.current_task || "";
+        var currentLabel = NODE_LABELS[currentTask] || currentTask;
+        el("detail-meta").textContent = currentTask ? "当前节点：" + currentLabel : "当前节点：-";
+
+        var route = data.route_decision || {};
+        var routeTarget = route.target && route.target !== "end"
+          ? (NODE_LABELS[route.target] || route.target)
+          : "工作流结束";
+        el("detail-route").textContent = route.action
+          ? "Supervisor 调度：" + routeTarget + "（" + route.reason + "）"
+          : "";
+
+        var reviewStatus = data.review_status || "pending";
+        var reviewText = {
+          pending: "待执行",
+          needs_revision: "要求返修",
+          approved: "已通过",
+        }[reviewStatus] || reviewStatus;
+        el("detail-auto-review").textContent = "自动 Reviewer：" + reviewText;
 
         var plan = data.plan || [];
         var completed = data.completed || [];
         var active = { supervisor: true, reviewer: true, document: true };
-        plan.forEach(function (task) {
-          active[task] = true;
-          if (task === "product" || task === "architect") { active["review_" + task] = true; }
+        plan.forEach(function (stageId) {
+          active[stageId] = true;
+          if (stageId === "product" || stageId === "architect") {
+            active["review_" + stageId] = true;
+          }
         });
+
+        var revisionQueue = data.revision_queue || [];
+        var revisionTargets = revisionQueue.length ? revisionQueue :
+          (data.review_stage ? [data.review_stage] : []);
+        var revisionBox = el("detail-revision");
+        if (reviewStatus === "needs_revision" && revisionTargets.length) {
+          revisionBox.textContent = "自动评审回退目标：" + revisionTargets.map(function (stageId) {
+            return REVIEW_STAGE_LABELS[stageId] || NODE_LABELS[stageId] || stageId;
+          }).join("、");
+          revisionBox.classList.remove("hidden");
+        } else {
+          revisionBox.textContent = "";
+          revisionBox.classList.add("hidden");
+        }
+
+        var hasVersionedStages = Object.keys(data.stages || {}).length > 0;
+        var stageRows = plan.map(function (stageId) {
+          var stage = (data.stages || {})[stageId] || {};
+          var current = stageIsCurrent(data, stageId, completed);
+          var stateClass = current ? "current" :
+            stage.status === "stale" ? "stale" : "pending";
+          var stateText = current ? (hasVersionedStages ? "当前有效" : "当前有效（旧格式）") :
+            stage.status === "stale" ? "已失效" : "未生成";
+          var version = stage.artifact_version ? "v" + stage.artifact_version :
+            current && !hasVersionedStages ? "v1（兼容）" : "-";
+          var inputs = stage.input_versions && Object.keys(stage.input_versions).length
+            ? Object.keys(stage.input_versions).map(function (key) {
+                return key + " v" + stage.input_versions[key];
+              }).join(", ")
+            : "-";
+          var gateStatus = stage.gate_status;
+          if (!gateStatus && !hasVersionedStages && (stageId === "product" || stageId === "architect")) {
+            gateStatus = completed.indexOf("review_" + stageId) !== -1 ? "approved" : "pending";
+          }
+          var gate = gateStatus === "approved" ? "已通过" :
+            gateStatus === "pending" ? "待确认" :
+            gateStatus === "not_required" ? "无需确认" : "-";
+          return "<tr>" +
+            "<td>" + escapeHtml(NODE_LABELS[stageId] || stageId) + "</td>" +
+            "<td><span class='stage-state " + stateClass + "'>" + stateText + "</span></td>" +
+            "<td>" + escapeHtml(version) + "</td>" +
+            "<td>" + escapeHtml(inputs) + "</td>" +
+            "<td>" + escapeHtml(gate) + "</td>" +
+            "</tr>";
+        }).join("");
+        var summary = el("detail-stage-summary");
+        if (plan.length) {
+          summary.innerHTML = "<table><thead><tr>" +
+            "<th>阶段</th><th>状态</th><th>产物版本</th><th>输入版本</th><th>闸门</th>" +
+            "</tr></thead><tbody>" + stageRows + "</tbody></table>";
+          summary.classList.remove("hidden");
+        } else {
+          summary.innerHTML = "";
+          summary.classList.add("hidden");
+        }
+
         el("detail-plan").innerHTML = PIPELINE.map(function (node) {
           var label = NODE_LABELS[node] || node;
           if (!active[node]) {
             return "<span class='chip disabled' title='当前 Agent 集合未启用'>" + label + "</span>";
           }
-          if (data.status === "done" || completed.indexOf(node) !== -1) {
+          if (nodeIsDone(data, node, completed)) {
             return "<span class='chip done'>" + label + " ✓</span>";
           }
-          if (data.current_task === node) {
+          if (currentTask === node) {
             return "<span class='chip running'>" + label + " …</span>";
+          }
+          if (nodeIsStale(data, node)) {
+            var staleLabel = node === "reviewer" ? label + " · 需返修" : label + " · 待重做";
+            return "<span class='chip stale' title='当前产物已失效，不会计为完成'>" + staleLabel + "</span>";
           }
           return "<span class='chip'>" + label + "</span>";
         }).join("");
@@ -313,32 +442,44 @@
         if (data.error) { errBox.textContent = data.error; errBox.classList.remove("hidden"); }
         else errBox.classList.add("hidden");
 
-        // 待确认
+        // 人工 Gate 的 interrupt 与自动 Reviewer 是两种不同的审核状态。
         var review = data.review;
         show("review-box", !!review);
         if (review) {
           var label = REVIEW_STAGE_LABELS[review.stage] || review.stage;
-          el("review-title").textContent = "待确认：" + label;
+          el("review-title").textContent = "人工确认待处理：" + label;
           el("review-round").textContent = "第 " + review.round + "/" + review.max_rounds + " 轮";
           el("review-artifact").textContent = JSON.stringify(review.artifact, null, 2);
         }
 
-        // 操作按钮
         show("btn-resume", data.status === "failed" || data.status === "running");
         show("btn-rerun", !!data.idea);
-        show("btn-doc", data.status === "done");
+        show("btn-doc", data.document_status === "current" || data.status === "done");
 
+        // 回退或重跑会使旧文档快照失效，详情页不能继续展示旧内容。
+        if (data.document_status === "stale" && state.selected === data.run_id) {
+          state.docLoadedFor = "";
+          el("doc").innerHTML = "";
+        }
         if (data.status === "done") loadDocument();
       }
-
       function loadDocument() {
-        if (state.docLoading) return;
-        state.docLoading = true;
-        fetch("/api/runs/" + state.selected + "/document")
+        var runId = state.selected;
+        if (!runId || state.docLoadingFor === runId || state.docLoadedFor === runId) return;
+        state.docLoadingFor = runId;
+        fetch("/api/runs/" + runId + "/document")
           .then(function (res) { if (!res.ok) throw new Error("文档获取失败：" + res.status); return res.text(); })
-          .then(function (text) { el("doc").innerHTML = renderMarkdown(text); })
-          .catch(function (err) { setError(String(err)); })
-          .finally(function () { state.docLoading = false; });
+          .then(function (text) {
+            if (state.selected !== runId) return;
+            el("doc").innerHTML = renderMarkdown(text);
+            state.docLoadedFor = runId;
+          })
+          .catch(function (err) {
+            if (state.selected === runId) setError(String(err));
+          })
+          .finally(function () {
+            if (state.docLoadingFor === runId) state.docLoadingFor = "";
+          });
       }
 
       // ---- 操作 ----

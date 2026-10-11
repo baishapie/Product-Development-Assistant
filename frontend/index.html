@@ -260,13 +260,35 @@
         var plan = data ? data.plan || [] : [];
         var completed = data ? data.completed || [] : [];
         var current = data ? data.current_task || "" : "";
+        var revisionQueue = data ? data.revision_queue || [] : [];
         var active = { supervisor: true, reviewer: true, document: true };
         plan.forEach(function (task) {
           active[task] = true;
           if (task === "product" || task === "architect") { active["review_" + task] = true; }
         });
 
-        el("current").textContent = current ? "当前节点：" + (NODE_LABELS[current] || current) : "";
+        var currentText = current ? "当前节点：" + (NODE_LABELS[current] || current) : "";
+        if (revisionQueue.length && data && data.review_status === "needs_revision") {
+          currentText = "自动评审回退：" + revisionQueue.map(function (stage) {
+            return NODE_LABELS[stage] || stage;
+          }).join("、");
+        }
+        el("current").textContent = currentText;
+
+        function stageIsCurrent(node) {
+          var info = data && data.stages ? data.stages[node] : null;
+          return info && info.status === "current" && completed.indexOf(node) !== -1;
+        }
+        function nodeIsDone(node) {
+          if (node === "supervisor") return false;
+          if (node === "reviewer") return data && data.review_status === "approved";
+          if (node === "document") return data && data.document_status === "current";
+          if (node.indexOf("review_") === 0) {
+            var stage = node.slice("review_".length);
+            return data && data.stages && data.stages[stage] && data.stages[stage].gate_status === "approved";
+          }
+          return stageIsCurrent(node);
+        }
 
         show("progress-card", plan.length > 0 || !!current);
         if (plan.length > 0 || current) {
@@ -275,7 +297,7 @@
             if (!active[node]) {
               return "<span class='chip disabled' title='当前 Agent 集合未启用'>" + label + "</span>";
             }
-            if (data && (data.status === "done" || completed.indexOf(node) !== -1)) {
+            if (nodeIsDone(node)) {
               return "<span class='chip done'>" + label + " ✓</span>";
             }
             if (current === node) {
@@ -380,11 +402,11 @@
       // ---- 历史任务 ----
       function loadRuns() {
         var box = el("run-list");
-        fetch("/api/runs?limit=20")
+        fetch("/api/runs?limit=5")
           .then(function (res) { if (!res.ok) throw new Error("加载失败：" + res.status); return res.json(); })
           .then(function (json) {
             if (!json.items || !json.items.length) { box.innerHTML = "<div class='muted'>暂无任务</div>"; return; }
-            box.innerHTML = json.items.map(function (item) {
+            box.innerHTML = json.items.slice(0, 5).map(function (item) {
               var canResume = item.status === "failed" || item.status === "running";
               return "<div class='run-item'>" +
                 "<span class='badge " + item.status + "'>" + (STATUS_TEXT[item.status] || item.status) + "</span>" +

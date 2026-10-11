@@ -19,9 +19,9 @@ from backend.config import Settings
 logger = logging.getLogger(__name__)
 
 # 允许写入 runs 表的列
-_COLUMNS = {"status", "current_task", "plan", "completed", "error", "output_path", "review"}
+_COLUMNS = {"status", "current_task", "plan", "completed", "error", "output_path", "review", "workflow"}
 # 需按 JSONB 写入的列
-_JSON_COLUMNS = {"plan", "completed", "review"}
+_JSON_COLUMNS = {"plan", "completed", "review", "workflow"}
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -35,9 +35,11 @@ CREATE TABLE IF NOT EXISTS runs (
     error         TEXT,
     output_path   TEXT,
     review        JSONB,
+    workflow      JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS workflow JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
 """
@@ -150,6 +152,7 @@ class MemoryRunStore:
                 "error": None,
                 "output_path": None,
                 "review": None,
+                "workflow": {},
                 "created_at": _now(),
                 "updated_at": _now(),
             }
@@ -253,8 +256,8 @@ class PostgresRunStore:
     def create(self, run_id: str, idea: str) -> None:
         with self._pool.connection() as conn:
             conn.execute(
-                "INSERT INTO runs (run_id, thread_id, idea, status, plan, completed) "
-                "VALUES (%s, %s, %s, 'running', '[]'::jsonb, '[]'::jsonb)",
+                "INSERT INTO runs (run_id, thread_id, idea, status, plan, completed, workflow) "
+                "VALUES (%s, %s, %s, 'running', '[]'::jsonb, '[]'::jsonb, '{}'::jsonb)",
                 (run_id, run_id, idea),
             )
 

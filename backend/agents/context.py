@@ -189,10 +189,15 @@ def _relevant_sections(task: str, issues: list[Mapping[str, Any]]) -> tuple[str,
 
 def revision_context(state: Mapping[str, Any], task: str) -> list[str]:
     """生成三段式修订输入：问题与验收条件、相关旧稿章节、统一修订指令。"""
-    if state.get("review_decision") != "revise" or state.get("review_stage") != task:
+    revision_queue = state.get("revision_queue") or []
+    if state.get("review_decision") != "revise" or (
+        state.get("review_stage") != task and task not in revision_queue
+    ):
         return []
     parts: list[str] = []
-    issues = state.get("review_issues") or []
+    issue_lists = state.get("review_issue_lists") or {}
+    issues = issue_lists.get(task) if isinstance(issue_lists, Mapping) else None
+    issues = issues if isinstance(issues, list) else state.get("review_issues") or []
     relevant = [
         issue for issue in issues
         if isinstance(issue, Mapping) and issue.get("target") == task
@@ -201,6 +206,8 @@ def revision_context(state: Mapping[str, Any], task: str) -> list[str]:
         issue_view = [
             {
                 "issue_id": issue.get("issue_id"),
+                "problem": issue.get("problem", ""),
+                "suggestion": issue.get("suggestion", ""),
                 "acceptance_criteria": issue.get("acceptance_criteria") or [],
             }
             for issue in relevant

@@ -18,6 +18,13 @@ def create_chat_model(settings: Settings) -> BaseChatModel:
     ``max_retries=0``：重试交给工作流节点（``AGENT_MAX_RETRIES``）统一控制。
     """
     config = settings.provider_config()
+
+    extra_body = (
+        {"thinking": {"type": "disabled"}}
+        if config.provider == "deepseek"
+        else None
+    )
+
     return ChatOpenAI(
         model=config.model,
         base_url=config.base_url,
@@ -25,4 +32,5 @@ def create_chat_model(settings: Settings) -> BaseChatModel:
         temperature=config.temperature,
         timeout=config.timeout,
         max_retries=0,
+        extra_body=extra_body
     )

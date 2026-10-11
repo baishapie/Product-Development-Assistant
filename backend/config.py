@@ -73,8 +73,6 @@ class Settings(BaseSettings):
     output_dir: Path = Path("./output")
     # Agent 集合：mvp=product/architect；full=+backend/frontend/qa
     agent_set: AgentSetName = "mvp"
-    # 是否让 backend/frontend 并行执行（静态 fanout/join）
-    parallel_agents: bool = False
 
     # --- Server ---
     host: str = "127.0.0.1"

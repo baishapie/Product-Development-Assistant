@@ -196,9 +196,6 @@ class RunManager:
             "configurable": {"thread_id": run.thread_id},
             "recursion_limit": recursion_limit,
         }
-        if settings.parallel_agents:
-            # 允许 super-step 内并行节点真正并发执行
-            config["max_concurrency"] = 4
         if self._callbacks:
             config["callbacks"] = self._callbacks
         return config
@@ -221,11 +218,38 @@ class RunManager:
             return dict(run.record["review"])
         return None
 
+    @staticmethod
+    def _workflow_view(values: dict[str, Any] | None) -> dict[str, Any]:
+        """Extract the public workflow view without exposing full Agent payloads."""
+        values = values or {}
+        return {
+            "stages": values.get("stages") or {},
+            "revision_queue": values.get("revision_queue") or [],
+            "review_status": values.get("review_status") or "pending",
+            "review_stage": values.get("review_stage"),
+            "review_issues": values.get("review_issues") or [],
+            "review_issue_ledger": {
+                str(issue_id): {
+                    key: value for key, value in issue.items() if not key.startswith("_")
+                }
+                for issue_id, issue in (values.get("review_issue_ledger") or {}).items()
+                if isinstance(issue, dict)
+            },
+            "document_status": values.get("document_status") or "pending",
+            "route_decision": values.get("route_decision") or {},
+        }
+
+    @staticmethod
+    def _workflow_payload(values: dict[str, Any] | None) -> dict[str, Any]:
+        """Build the compact JSON payload persisted with a run."""
+        return RunManager._workflow_view(values)
+
     def status(self, run: Run) -> dict[str, Any]:
         """汇总运行状态，供 API 返回。"""
         if not run.result and run.record:
             return self._status_from_record(run.record)
 
+        workflow = self._workflow_view(run.result)
         base: dict[str, Any] = {
             "run_id": run.run_id,
             "idea": run.idea,
@@ -233,6 +257,7 @@ class RunManager:
             "completed": run.result.get("completed", []),
             "plan": run.result.get("plan", []),
             "error": run.error or run.result.get("error"),
+            **workflow,
         }
         if run.error:
             return {**base, "status": "failed", "review": None}
@@ -255,6 +280,7 @@ class RunManager:
     def _status_from_record(record: dict[str, Any]) -> dict[str, Any]:
         review = record.get("review")
         review_view = {key: review.get(key) for key in _REVIEW_FIELDS} if review else None
+        workflow = RunManager._workflow_view(record.get("workflow"))
         return {
             "run_id": record["run_id"],
             "idea": record.get("idea"),
@@ -262,6 +288,7 @@ class RunManager:
             "current_task": record.get("current_task"),
             "completed": record.get("completed") or [],
             "plan": record.get("plan") or [],
+            **workflow,
             "error": record.get("error"),
             "review": review_view,
         }
@@ -285,6 +312,7 @@ class RunManager:
             "current_task": run.result.get("current_task"),
             "plan": run.result.get("plan") or [],
             "completed": run.result.get("completed") or [],
+            "workflow": self._workflow_payload(run.result),
         }
         if run.error:
             fields.update(status="failed", error=run.error)
@@ -324,6 +352,7 @@ class RunManager:
             output_path=values.get("output_path"),
             error=values.get("error"),
             review=review,
+            workflow=self._workflow_payload(values),
         )
 
 

@@ -42,6 +42,14 @@ class RunStatus(BaseModel):
     current_task: str | None = None
     completed: list[str] = Field(default_factory=list)
     plan: list[str] = Field(default_factory=list)
+    stages: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    revision_queue: list[str] = Field(default_factory=list)
+    review_status: str = "pending"
+    review_stage: str | None = None
+    review_issues: list[dict[str, Any]] = Field(default_factory=list)
+    review_issue_ledger: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    document_status: str = "pending"
+    route_decision: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     review: ReviewView | None = None
 

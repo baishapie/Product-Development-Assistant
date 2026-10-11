@@ -1,9 +1,4 @@
-"""工作流共享状态（LangGraph ``StateGraph`` 的 channel 定义）。
-
-累加型字段用 ``Annotated`` 声明 reducer：LangGraph 只对顶层字段做合并，
-嵌套 dict 默认整体覆盖，若不声明 reducer，节点返回 ``{"results": {...}}``
-会把其它 Agent 的结果一并覆盖掉。
-"""
+"""State contract shared by the deterministic LangGraph workflow."""
 
 from __future__ import annotations
 
@@ -12,55 +7,62 @@ from typing import Annotated, Any, TypedDict
 
 
 def merge_dict(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
-    """合并字典型状态字段（results / retries / review_rounds / gate_status）。"""
+    """Merge partial keyed updates without clobbering unrelated entries."""
     return {**left, **right}
 
 
-def merge_last(left: Any, right: Any) -> Any:
-    """并发写入时取最后一次（last-write-wins）。
+def merge_stage_maps(
+    left: dict[str, dict[str, Any]], right: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Merge stage metadata one stage at a time."""
+    merged = {stage_id: dict(value) for stage_id, value in left.items()}
+    for stage_id, patch in right.items():
+        merged[stage_id] = {**merged.get(stage_id, {}), **patch}
+    return merged
 
-    用于可能被**同一步并行节点**写入的标量通道（如 `current_task`），
-    否则 LangGraph 会因"同一 step 只能收到一个值"报 `InvalidUpdateError`。
-    串行场景下与默认覆盖语义一致。
-    """
+
+def merge_last(_left: Any, right: Any) -> Any:
+    """Use the latest update for a single-owner state channel."""
     return right
 
 
 class AgentState(TypedDict):
-    """工作流在各节点间传递的共享状态。"""
+    """Complete runtime state; nodes return only partial updates."""
 
-    # 输入
     run_id: str
     idea: str
-    # 规划与路由（Supervisor）
     plan: list[str]
     next_action: str | None
     iteration_count: int
-    completed: Annotated[list[str], operator.add]
-    # 可能被并行节点（backend/frontend）同时写入，用 merge_last 容忍多写
+    completed: Annotated[list[str], merge_last]
     current_task: Annotated[str | None, merge_last]
-    # 各 Agent 结果：task_id -> 结构化 dict（Pydantic model_dump 后）
     results: Annotated[dict[str, dict[str, Any]], merge_dict]
-    # 产物
     product_document: str
     output_path: str
-    # 控制（可能被并行节点写入，容忍多写）
-    status: Annotated[str, merge_last]  # "running" | "awaiting_review" | "done" | "failed"
+    status: Annotated[str, merge_last]
     error: Annotated[str | None, merge_last]
     retries: Annotated[dict[str, int], merge_dict]
-    # 人工确认（HITL）与自动评审
-    review_stage: str | None  # "product" | "architect" | None
-    review_decision: Annotated[str | None, merge_last]  # approved/revise/skipped/None
+    review_stage: str | None
+    review_decision: Annotated[str | None, merge_last]
     review_feedback: Annotated[str | None, merge_last]
+    review_issue_lists: Annotated[dict[str, list[dict[str, Any]]], merge_dict]
     review_issues: Annotated[list[dict[str, Any]], merge_last]
+    review_issue_ledger: Annotated[dict[str, dict[str, Any]], merge_dict]
     review_rounds: Annotated[dict[str, int], merge_dict]
-    gate_status: Annotated[dict[str, str], merge_dict]  # stage -> approved/revise/skipped
-    # 预留：Memory(Phase 3) / 对话历史
+    gate_status: Annotated[dict[str, str], merge_dict]
     messages: Annotated[list[dict[str, str]], operator.add]
+    stages: Annotated[dict[str, dict[str, Any]], merge_stage_maps]
+    revision_queue: Annotated[list[str], merge_last]
+    review_status: Annotated[str, merge_last]
+    review_result: Annotated[dict[str, Any], merge_last]
+    review_approved_snapshot: Annotated[dict[str, int] | None, merge_last]
+    document_status: Annotated[str, merge_last]
+    document_snapshot: Annotated[dict[str, int], merge_last]
+    route_decision: Annotated[dict[str, Any], merge_last]
 
 
 def new_state(idea: str, run_id: str | None = None) -> AgentState:
-    """构造工作流初始状态；所有 key 均有初值以符合 reducer 语义。"""
+    """Create a fresh run with every channel initialized."""
     return {
         "run_id": run_id or "",
         "idea": idea,
@@ -78,8 +80,18 @@ def new_state(idea: str, run_id: str | None = None) -> AgentState:
         "review_stage": None,
         "review_decision": None,
         "review_feedback": None,
+        "review_issue_lists": {},
         "review_issues": [],
+        "review_issue_ledger": {},
         "review_rounds": {},
         "gate_status": {},
         "messages": [],
+        "stages": {},
+        "revision_queue": [],
+        "review_status": "pending",
+        "review_result": {},
+        "review_approved_snapshot": None,
+        "document_status": "pending",
+        "document_snapshot": {},
+        "route_decision": {},
     }
